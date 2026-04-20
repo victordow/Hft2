@@ -1,79 +1,86 @@
 #!/usr/bin/env python3
 """
-HFT Simulation Lab v2 — NegRisk arb detection on Polymarket CLOB.
+HFT Simulation Lab v2 — Polymarket NegRisk edge survey (VPS standalone)
 
-Correções sobre o v1 (auditoria de 20/abr/2026):
-  - Bugs de dados: ghost/terminal books filtrados por snapshot, não por universo
-  - Bugs de lógica: check_deviation agora aplica fees e thresholds; book locked
-    (ask<=bid) rejeita snapshot inteiro
-  - Bugs de medição: `actual_delay_ms` removido (não media nada). Substituído
-    por edge_decay contra snapshot com update REAL pós-detecção
-  - Bugs de contagem: persist incremental (um parquet por janela de 15min com
-    só o que foi adicionado); cooldown estendido com detecção de "reopen"
-  - Bugs de concorrência: asyncio.Event para shutdown; log explícito de
-    exceções de reconexão; backoff capped em 60s
-  - Book completo (não só best_bid/ask) guardado para calcular depth executável
-  - price_change aplicado como delta ao book local (v1 lia campos inexistentes)
-  - Re-discovery periódica (30min) marca resolvidos como inactive
-  - status.json sobrescrito a cada 30s para monitoramento remoto sem TTY
-  - Sanity alerts em tempo real (P90 edge, concentração, regressão de bugs)
+Mudancas em relacao ao v1 (ver AUDITORIA.md para rationale completo):
+
+  * Persist INCREMENTAL (so o delta desde o ultimo batch) -- fim do
+    double-count que inflacionava P&L em ~30x.
+  * Cooldown baseado em JANELA (opportunity aberta vs. fechada), nao
+    timer de 3s -- mesmo mercado so gera nova detecao quando o edge
+    volta a zero e reabre.
+  * Filtro ghost/terminal/dust multi-camada POR SNAPSHOT (nao por
+    mercado) -- mercado pode estar ruim agora e bom em 2h.
+  * Book DEPTH real calculado de price*size em todos os levels (v1
+    usava sum_bid*50, um placeholder que sempre caia em <$200).
+  * price_change handler aplica deltas ao book local (v1 lia campos
+    que nao existem no payload).
+  * Edge DECAY real: scheduler aguarda, le snapshot que so foi criado
+    a partir de update real do WS pos-detecao (v1 pegava cache
+    rematado a cada 200ms).
+  * net_edge = gross_edge - fee_load (aproximacao upper-bound de
+    n*fee_rate*0.25); DetectionRecord persiste os dois.
+  * Shutdown graceful via asyncio.Event (v1 usava bool que demorava
+    ate 2min para propagar).
+  * status.json reescrito a cada 30s para monitoramento mobile.
+  * Sanity alerts em tempo real (edge P90>10%, book locked >5%, etc).
+  * Exceptions de WS logadas com tipo + mensagem (v1 engolia).
+  * Re-discovery de mercados a cada 30min (v1 selecionava uma vez
+    e rodava com survivorship bias).
+  * Metrica FAKE de actual_delay removida -- substituida por
+    surviving_edge_ratio contra snapshot pos-update.
+  * MIN_DAYS = 1.0 (v1 era 2h, fabrica de ghost em mercados resolvendo).
 
 Uso:
-    python3 hft_sim_v2.py                  # 16h, 80 mercados (defaults)
-    python3 hft_sim_v2.py --hours 18       # override duração
-    python3 hft_sim_v2.py --markets 120    # mais mercados
+    python3 hft_sim_v2.py                   # 16h default, 80 mercados
+    python3 hft_sim_v2.py --hours 2         # teste rapido
+    python3 hft_sim_v2.py --markets 120     # mais mercados
 
-Rodar em background (Hetzner + Terminus/SSH):
+Para rodar em VPS via SSH (Terminus, etc):
     tmux new -s hft
     python3 hft_sim_v2.py --hours 16
-    # Ctrl+B, D para detach. Fecha SSH tranquilo.
-    # Amanhã: tmux attach -t hft
+    # Ctrl+B depois D -> detach, pode fechar SSH
+    # tmux attach -t hft -> voltar a sessao
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
-import logging
 import os
 import signal
 import sys
 import time
+import traceback
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, getcontext
 from pathlib import Path
-from statistics import median
-from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Deque, Optional
 
 import httpx
 import websockets
-from websockets.exceptions import ConnectionClosed, WebSocketException
+from websockets.exceptions import ConnectionClosed
 
 try:
     import pandas as pd
     HAS_PANDAS = True
 except ImportError:
-    print("ERRO: pandas + pyarrow obrigatórios. Rode: pip install pandas pyarrow",
-          file=sys.stderr)
+    print("ERROR: pandas nao instalado. Rode: pip install pandas pyarrow", file=sys.stderr)
     HAS_PANDAS = False
 
 getcontext().prec = 28
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# CONFIG
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# CONSTANTES
+# ============================================================
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# Fee rates (Polymarket, regime pós-30/mar/2026). Fórmula para taker fee:
-#   fee_usdc = shares * fee_rate * p * (1 - p)
-# Para arb NegRisk com N outcomes em p médio, fee_load_per_1_usdc_notional ≈
-# sum(fee_rate * p_i * (1 - p_i)) — calculado por snapshot nas funções abaixo.
-FEE_RATE: Dict[str, Decimal] = {
+# Fees por categoria (Polymarket, regime vigente a partir de 30/mar/2026).
+FEE_RATE: dict[str, Decimal] = {
     "crypto": Decimal("0.0720"),
     "economics": Decimal("0.0600"),
     "mentions": Decimal("0.0624"),
@@ -85,75 +92,64 @@ FEE_RATE: Dict[str, Decimal] = {
     "finance": Decimal("0.0400"),
     "politics": Decimal("0.0400"),
     "tech": Decimal("0.0400"),
+    "elections": Decimal("0.0400"),
     "sports": Decimal("0.0300"),
     "geopolitics": Decimal("0"),
     "middle-east": Decimal("0"),
-    "elections": Decimal("0.0400"),
-    "unknown": Decimal("0.0500"),  # conservador mas não extremo (era 0.072 em v1)
 }
-DEFAULT_FEE = FEE_RATE["unknown"]
+DEFAULT_FEE = Decimal("0.0720")
 
-# Duração & universo
+# --- Parametros de simulacao ---
 DEFAULT_DURATION_HOURS = 16.0
 DEFAULT_N_MARKETS = 80
 MAX_TOKENS_PER_CONN = 50
 
-# Filtros de descoberta (universo)
-VOL_MIN = Decimal("5000")           # volume total histórico mínimo
-VOL_MAX = Decimal("5000000")
+# Universe selection (operador aprovou: NAO cortar 30-40% por volume24hr)
+VOL_MIN_TOTAL = Decimal("5000")
+VOL_MAX_TOTAL = Decimal("5000000")
 MIN_OUTCOMES = 2
-MIN_OUTCOMES_NEGRISK = 2
 MAX_OUTCOMES = 20
-MIN_DAYS = Decimal("1")             # 24h mínimo de resolução (era 2h no v1)
+MIN_DAYS = Decimal("1.0")      # v1 era 0.0833 (2h). Eleva para 1d.
 MAX_DAYS = Decimal("180")
 
-# Re-discovery
-REDISCOVERY_INTERVAL_SEC = 30 * 60   # 30min
-
-# Detector
-DETECTION_INTERVAL_MS = 500
+# Intervalos
+DETECTION_INTERVAL_SEC = 0.5
+SNAPSHOT_INTERVAL_SEC = 0.2
+STATUS_INTERVAL_SEC = 30
+PERSIST_INTERVAL_SEC = 900         # 15 min (v1: 120s)
+REDISCOVERY_INTERVAL_SEC = 1800    # 30 min (v1: nunca)
 STALENESS_MS = 30_000
-SNAPSHOT_HISTORY_PER_EVENT = 400     # 80s de buffer @ 200ms — cobre edge_decay 5s
-MAX_ACTIVE_MEASUREMENTS = 500
 
-# Cooldown estendido (bug #13): por default 10min, mas só vale enquanto a
-# oportunidade está "aberta"; se o desvio zerar entre detecções, permite nova.
-DETECTION_COOLDOWN_MS = 10 * 60 * 1000  # 10min
+# Edge decay (substitui a metrica fake de actual_delay do v1)
+DECAY_TARGETS_MS = [300, 1000, 2000, 5000]
+MAX_ACTIVE_DECAY_TASKS = 2000
 
-# Thresholds para filtro de snapshot (bugs #3, #8, #19)
-GHOST_ASK_MAX = Decimal("0.02")     # ask <= 0.02 + bid<=0.01 = ghost
-GHOST_BID_MAX = Decimal("0.01")
-TERMINAL_ASK_MIN = Decimal("0.98")  # ask>=0.98 + bid>=0.97 = quase resolveu
-TERMINAL_BID_MIN = Decimal("0.97")
-MAX_SPREAD = Decimal("0.30")        # spread > 30c = book vazio
-MIN_DEPTH_USD_PER_OUTCOME = Decimal("5")   # dust floor — por outcome
-MIN_DUST_NOTIONAL = Decimal("1.0")         # ignora levels com price*size < $1
+# Deteccao (thresholds)
+MIN_GROSS_EDGE = Decimal("0.002")  # 0.2% gross (abaixo eh ruido)
+SNAPSHOT_HISTORY_LEN = 300          # ~60s a 200ms (v1: 10s, insuficiente)
 
-# Edge thresholds (bug #5, #14)
-MIN_GROSS_EDGE_RAW = Decimal("0.005")   # 0.5% bruto — piso cético
-MIN_NET_EDGE_AFTER_FEES = Decimal("0.002")  # 0.2% líquido — piso viabilidade
+# Ghost/terminal filters (per-snapshot)
+MAX_SPREAD_PER_OUTCOME = Decimal("0.30")
+GHOST_DUST_ASK = Decimal("0.02")
+GHOST_DUST_BID = Decimal("0.01")
+MIN_LEVEL_NOTIONAL_USD = Decimal("1.0")  # dust: price*size < $1 ignorado
+SUM_BID_RANGE = (Decimal("0.5"), Decimal("1.5"))  # sanity NegRisk
 
-# Edge decay targets (substitui latency em v1)
-EDGE_DECAY_TARGETS_MS = [300, 1000, 2000, 5000]
+# Cooldown por janela (nao por tempo)
+MIN_OPPORTUNITY_GAP_MS = 2000  # entre "fechou" e considera "reabriu"
 
-# Persist / observabilidade
-CHECKPOINT_INTERVAL_SEC = 15 * 60   # 15min
-STATUS_INTERVAL_SEC = 30            # status.json a cada 30s
-STATUS_CONSOLE_INTERVAL_SEC = 120   # log verboso a cada 2min
+# Sanity alerts
+ALERT_P90_EDGE_THRESHOLD = Decimal("0.10")  # 10%
+ALERT_EVENT_CONCENTRATION = 0.50            # mesmo event >50% detecoes
+ALERT_BUCKET_CONCENTRATION = 0.90           # mesmo bucket >90% detecoes
+ALERT_LOCKED_BOOK_RATE = 0.05               # bid>=ask em >5% outcomes
+ALERT_ROLLING_WINDOW_SEC = 600              # janela de 10min
 
-# Alert thresholds (sanity checks em tempo real)
-ALERT_P90_EDGE_THRESHOLD = Decimal("0.10")   # edge P90 > 10% = WARN
-ALERT_CONCENTRATION_PCT = Decimal("0.50")    # >50% detecções em 1 mercado = WARN
-ALERT_BUCKET_DOMINANCE_PCT = Decimal("0.90") # >90% em 1 bucket = WARN
-ALERT_LOCKED_BOOK_PCT = Decimal("0.05")      # >5% outcomes ask<=bid = WARN
-
-
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # UTILS
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 def to_decimal(v: Any) -> Optional[Decimal]:
-    """Conversão robusta para Decimal; qualquer input duvidoso → None."""
     if v is None:
         return None
     if isinstance(v, Decimal):
@@ -161,7 +157,7 @@ def to_decimal(v: Any) -> Optional[Decimal]:
     if isinstance(v, bool):
         return Decimal(int(v))
     if isinstance(v, (int, float)):
-        return Decimal(str(v))  # via str para evitar ruído de float
+        return Decimal(str(v))
     if isinstance(v, str):
         s = v.strip()
         if not s:
@@ -172,28 +168,32 @@ def to_decimal(v: Any) -> Optional[Decimal]:
             return None
     return None
 
+
 d = to_decimal
 
 
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
 def infer_category(tags: list) -> str:
-    """
-    Classifica por tag. Ordem de especificidade: categorias mais específicas
-    primeiro (ex.: `elections` antes de `politics`), para casar com as taxas
-    reais da Polymarket.
-    """
+    """Ordem de prioridade: mais especifico primeiro."""
     labels = [
         (t.get("label") or t.get("slug") or "").lower()
         for t in (tags or [])
         if isinstance(t, dict)
     ]
-    # Ordem: do mais específico para o mais genérico.
     priority = [
-        "middle-east", "geopolitics",
-        "elections", "crypto",
-        "sports", "weather", "climate",
-        "pop-culture", "culture", "science",
-        "tech", "mentions",
-        "finance", "economics", "politics",
+        "geopolitics", "middle-east",
+        "crypto",
+        "sports",
+        "elections",      # antes de "politics" (mais especifico)
+        "weather", "climate",
+        "culture", "pop-culture",
+        "tech", "science",
+        "finance", "economics",
+        "politics",
+        "mentions",
     ]
     for p in priority:
         for label in labels:
@@ -204,6 +204,15 @@ def infer_category(tags: list) -> str:
 
 def fee_for(cat: str) -> Decimal:
     return FEE_RATE.get(cat, DEFAULT_FEE)
+
+
+def fee_load_approx(fee_rate: Decimal, n_outcomes: int) -> Decimal:
+    """
+    Upper bound do fee load agregado em p=0.5 (pior caso individual):
+        fee_load_max = n_outcomes * fee_rate * 0.25
+    Conservador (super-estima ligeiramente).
+    """
+    return Decimal(n_outcomes) * fee_rate * Decimal("0.25")
 
 
 def parse_end_date(raw: Any) -> Optional[datetime]:
@@ -226,32 +235,30 @@ def days_until(end_dt: Optional[datetime]) -> Optional[Decimal]:
 
 
 def volume_bucket(v: Decimal) -> str:
-    vf = float(v)
-    if vf < 10_000:
+    f = float(v)
+    if f < 10_000:
         return "<$10K"
-    if vf < 50_000:
+    if f < 50_000:
         return "$10-50K"
-    if vf < 200_000:
+    if f < 200_000:
         return "$50-200K"
-    if vf < 1_000_000:
+    if f < 1_000_000:
         return "$200K-1M"
     return ">$1M"
 
 
-def book_depth_bucket_usd(depth_usd: Decimal) -> str:
-    vf = float(depth_usd)
-    if vf < 50:
-        return "<$50"
-    if vf < 200:
-        return "$50-200"
-    if vf < 1_000:
+def book_depth_bucket(d_val: Decimal) -> str:
+    f = float(d_val)
+    if f < 200:
+        return "<$200"
+    if f < 1000:
         return "$200-1k"
-    if vf < 3_000:
+    if f < 3000:
         return "$1-3k"
     return ">$3k"
 
 
-def time_bucket_hours(hours: float) -> str:
+def time_bucket(hours: float) -> str:
     if hours < 24:
         return "<24h"
     if hours < 7 * 24:
@@ -261,17 +268,9 @@ def time_bucket_hours(hours: float) -> str:
     return ">30d"
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
 # DATACLASSES
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
 
 @dataclass
 class BookLevel:
@@ -285,70 +284,13 @@ class BookLevel:
 
 @dataclass
 class OutcomeState:
-    """Estado do book do token YES de um outcome do NegRisk event."""
+    """Estado de 1 outcome (YES-token). Guarda book completo, nao so best."""
     event_idx: int
     question: str
     yes_token: str
-
-    # Book COMPLETO (não só best). Ordenado: bids desc por preço, asks asc.
-    bids: List[BookLevel] = field(default_factory=list)
-    asks: List[BookLevel] = field(default_factory=list)
-
-    # Timestamps — separados entre "última mensagem WS recebida para este
-    # outcome" (real) e "último cálculo de best" (derivado).
+    bids: list[BookLevel] = field(default_factory=list)  # ordenado desc por price
+    asks: list[BookLevel] = field(default_factory=list)  # ordenado asc por price
     last_update_ms: int = 0
-    ever_updated: bool = False
-
-    # Status — marcado False quando detectamos que o market resolveu / ficou
-    # inative via re-discovery. Diferente de "stale" (que é temporal).
-    is_active: bool = True
-
-    def rebuild_from_snapshot(self, bids: List[BookLevel], asks: List[BookLevel],
-                              ts: int) -> None:
-        # Filtra dust (bug #8) no ingest, não depois.
-        self.bids = sorted(
-            [lv for lv in bids if lv.notional >= MIN_DUST_NOTIONAL],
-            key=lambda lv: -lv.price,
-        )
-        self.asks = sorted(
-            [lv for lv in asks if lv.notional >= MIN_DUST_NOTIONAL],
-            key=lambda lv: lv.price,
-        )
-        self.last_update_ms = ts
-        self.ever_updated = True
-
-    def apply_price_change(self, side: str, price: Decimal, size: Decimal,
-                           ts: int) -> None:
-        """
-        Aplica um delta do evento `price_change` ao book local.
-        Schema Polymarket: side ∈ {"BUY", "SELL"}, size = nova quantidade
-        NAQUELE preço (não delta), 0 = remove o nível.
-
-        Bug #9 corrigido: v1 lia `best_bid`/`best_ask` que não existem nesse
-        payload. Aqui aplicamos corretamente como delta ao book local.
-        """
-        if side == "BUY":
-            levels = self.bids
-            reverse = True  # bids em ordem decrescente
-        elif side == "SELL":
-            levels = self.asks
-            reverse = False
-        else:
-            return
-
-        # Remove nível existente naquele preço, se houver
-        levels[:] = [lv for lv in levels if lv.price != price]
-
-        # Se size > 0 e notional >= dust floor, adiciona de volta
-        if size > 0:
-            lv = BookLevel(price=price, size=size)
-            if lv.notional >= MIN_DUST_NOTIONAL:
-                levels.append(lv)
-
-        # Reordena
-        levels.sort(key=lambda lv: (-lv.price) if reverse else lv.price)
-        self.last_update_ms = ts
-        self.ever_updated = True
 
     @property
     def best_bid(self) -> Optional[Decimal]:
@@ -358,370 +300,657 @@ class OutcomeState:
     def best_ask(self) -> Optional[Decimal]:
         return self.asks[0].price if self.asks else None
 
-    def depth_usd_top_n(self, n: int = 5, side: str = "ask") -> Decimal:
-        """Depth executável agregado nos top-N níveis (default: ask, para compra)."""
-        levels = self.asks if side == "ask" else self.bids
-        return sum((lv.notional for lv in levels[:n]), Decimal("0"))
+    @property
+    def book_notional_usd(self) -> Decimal:
+        bid_not = sum((lvl.notional for lvl in self.bids), start=Decimal("0"))
+        ask_not = sum((lvl.notional for lvl in self.asks), start=Decimal("0"))
+        return bid_not + ask_not
 
 
 @dataclass
 class EventState:
     idx: int
-    title_full: str               # não trunca (bug #25)
+    title: str
     category: str
     fee_rate: Decimal
-    volume_total: Decimal
-    volume_24h: Decimal
-    outcomes: List[OutcomeState]
+    volume: Decimal
+    outcomes: list[OutcomeState]
     days_until_resolution: Decimal
-    volume_bucket: str
-    slug: str = ""
-    is_active: bool = True        # flip para False em re-discovery se resolveu
-
-    @property
-    def title_short(self) -> str:
-        return self.title_full[:60]
-
-    @property
-    def n_outcomes(self) -> int:
-        return len(self.outcomes)
+    volume_bucket_label: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class BookSnapshot:
     """
-    Snapshot consistente de um evento inteiro.
-    `based_on_update_ms` = o timestamp do OUTCOME mais recentemente atualizado.
-    Se snapshots consecutivos têm o mesmo valor aqui, o conteúdo é idêntico
-    (bug #2).
+    based_on_update_ts = max(outcome.last_update_ms).
+    Usado como "data real" do snapshot (v1 usava now_ms, que induzia
+    a ideia de que snapshots recombinados do cache eram novos).
     """
     timestamp_ms: int
-    based_on_update_ms: int
+    based_on_update_ts: int
     sum_ask: Decimal
     sum_bid: Decimal
-    asks: Tuple[Decimal, ...]
-    bids: Tuple[Decimal, ...]
-    depth_usd_min: Decimal         # menor depth entre outcomes
-    depth_usd_sum: Decimal         # soma dos depth_usd_top5 de todos outcomes
-    n_outcomes: int
-    fee_load_per_usdc: Decimal     # fee total por $1 de notional, mid-market
-
-    def is_valid(self) -> bool:
-        # Sanity: sum_ask >= sum_bid sempre (ask >= bid em todo outcome)
-        return self.sum_ask >= self.sum_bid
+    total_book_depth_usd: Decimal
+    locked_outcomes: int
+    rejected_snapshot: bool
 
 
 @dataclass
 class DetectionRecord:
     detection_id: int
-    opportunity_id: int            # mesmo entre detecções da mesma janela contínua
     detected_at_ms: int
     event_idx: int
     event_title: str
     category: str
+    fee_rate: float
+    n_outcomes: int
     volume_bucket: str
     time_bucket_label: str
-    direction: str                 # "LONG" (sum_ask<1) ou "SHORT" (sum_bid>1)
-
-    # Preços agregados
-    initial_sum_ask: Decimal
-    initial_sum_bid: Decimal
-    initial_gross_edge: Decimal    # max(0, 1-sum_ask) ou max(0, sum_bid-1)
-
-    # Net edge (bug #14 — v1 não tinha isso)
-    fee_load_per_usdc: Decimal
-    initial_net_edge_after_fees: Decimal
-    is_economically_viable: bool
-
-    # Depth & microestrutura
-    depth_usd_min: Decimal
-    depth_usd_sum: Decimal
-    depth_bucket: str
-    days_until_resolution: Decimal
-    n_outcomes: int
-
-    # Persistência de oportunidade
-    is_reopen: bool                # True se veio depois de desvio zerar
+    days_until_resolution: float
+    direction: str                  # LONG | SHORT
+    initial_sum_ask: float
+    initial_sum_bid: float
+    initial_gross_edge: float
+    initial_fee_load_approx: float
+    initial_net_edge: float
+    book_depth_usd: float
+    book_depth_bucket: str
+    closed_at_ms: Optional[int] = None
+    persisted_ticks: int = 0
 
 
 @dataclass
-class EdgeDecayMeasurement:
-    """
-    Substitui LatencyMeasurement do v1 (que media próprio sleep, bug #11).
-    Mede quanto edge sobra 300ms/1s/2s/5s após detecção — só vale se houve
-    update REAL do book nesse intervalo.
-    """
+class DecayMeasurement:
     detection_id: int
-    target_delay_ms: int
+    target_ms: int
     measured_at_ms: int
-    elapsed_ms_actual: int
-    had_real_update_post_detection: bool
-    surviving_edge: Optional[Decimal]
-    surviving_net_edge: Optional[Decimal]
+    book_source_update_ms: Optional[int]
+    book_available: bool
+    surviving_gross_edge: Optional[float]
+    surviving_direction_matches: bool
 
 
-@dataclass
-class DetectionClose:
-    """Registrado quando oportunidade fecha (desvio volta a zero)."""
-    detection_id: int
-    opportunity_id: int
-    opened_at_ms: int
-    closed_at_ms: int
-    duration_ms: int
-    max_gross_edge_seen: Decimal
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# LAB STATE
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# LAB
+# ============================================================
 
 class Lab:
-    """Estado global + I/O + observabilidade."""
-
-    def __init__(self, duration_sec: int, n_markets: int, output_dir: Path):
+    def __init__(self, duration_sec: float, n_markets: int, output_dir: Path):
         self.duration_sec = duration_sec
         self.n_markets = n_markets
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Universo
-        self.events: List[EventState] = []
-        self.token_to_outcome: Dict[str, OutcomeState] = {}
-
-        # Histórico de snapshots por evento (bug #23: 400 × 200ms = 80s buffer)
-        self.snapshot_history: Dict[int, Deque[BookSnapshot]] = defaultdict(
-            lambda: deque(maxlen=SNAPSHOT_HISTORY_PER_EVENT)
+        # State
+        self.events: list[EventState] = []
+        self.token_to_outcome: dict[str, OutcomeState] = {}
+        self.snapshot_history: dict[int, Deque[BookSnapshot]] = defaultdict(
+            lambda: deque(maxlen=SNAPSHOT_HISTORY_LEN)
         )
+        self.detections: list[DetectionRecord] = []
+        self.decays: list[DecayMeasurement] = []
 
-        # Detecções & medições — ACUMULATIVAS (raw store)
-        self.detections: List[DetectionRecord] = []
-        self.decay_measurements: List[EdgeDecayMeasurement] = []
-        self.detection_closes: List[DetectionClose] = []
+        # Opportunity window tracking
+        self.open_opportunities: dict[tuple[int, str], DetectionRecord] = {}
+        self.last_close_ms: dict[tuple[int, str], int] = {}
 
-        # Índices para persist incremental (bug #15)
-        # aponta para "próximo índice a persistir"
-        self._persisted_detection_idx = 0
-        self._persisted_decay_idx = 0
-        self._persisted_close_idx = 0
-        self.persist_batch_counter = 0
-        self.last_checkpoint_ts: Optional[float] = None
+        # Persistence cursors (incremental, fix do bug #15 do v1)
+        self._persisted_detections_cursor: int = 0
+        self._persisted_decays_cursor: int = 0
+        self._persist_seq: int = 0
 
-        # Tracking de oportunidades abertas (para cooldown com reopen — bug #13)
-        # key=(event_idx, direction) → dict com state
-        self.open_opportunities: Dict[Tuple[int, str], Dict[str, Any]] = {}
-        self._next_opportunity_id = 0
-
-        # Controle de medições ativas (limite anti-OOM)
-        self.active_measurements: set = set()
-        self._next_detection_id = 0
-
-        # WebSocket stats
-        self.conn_stats: Dict[int, Dict[str, int]] = defaultdict(
-            lambda: {"events": 0, "reconnects": 0}
+        # WS / tasks
+        self.conn_stats: dict[int, dict[str, int]] = defaultdict(
+            lambda: {"events": 0, "reconnects": 0, "last_event_ms": 0}
         )
-        self.ws_events_by_type: Counter = Counter()
+        self.ws_subscriptions: dict[int, list[str]] = {}
+        self._next_detection_id: int = 0
+        self._active_decay_tasks: int = 0
 
-        # Shutdown via Event (bug #22)
-        self.shutdown_event = asyncio.Event()
-
-        # Timestamps
+        # Control
+        self.shutdown_event: Optional[asyncio.Event] = None  # criado dentro do loop
         self.start_time: Optional[float] = None
 
-        # Logger (arquivo + stdout)
+        # Logging
         self.log_path = output_dir / "lab.log"
+        self.jsonl_path = output_dir / "events.jsonl"
+        self.status_path = output_dir / "status.json"
         self.log_file = open(self.log_path, "a", buffering=1)
+        self.jsonl_file = open(self.jsonl_path, "a", buffering=1)
 
-        # Alertas ativos (conjunto string → timestamp)
-        self.active_alerts: Dict[str, int] = {}
+        # Sanity alerts
+        self.active_alerts: dict[str, str] = {}
 
-        # Validação de snapshot por razão — para debug
-        self.rejection_counts: Counter = Counter()
+    def ensure_shutdown_event(self) -> asyncio.Event:
+        if self.shutdown_event is None:
+            self.shutdown_event = asyncio.Event()
+        return self.shutdown_event
 
     def log(self, msg: str, level: str = "INFO") -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}][{level}] {msg}"
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        line = f"[{ts}] [{level}] {msg}"
         print(line, flush=True)
-        self.log_file.write(line + "\n")
+        try:
+            self.log_file.write(line + "\n")
+        except Exception:
+            pass
 
-    def raise_alert(self, key: str, msg: str) -> None:
-        if key not in self.active_alerts:
-            self.log(f"ALERT[{key}]: {msg}", level="WARN")
-        self.active_alerts[key] = now_ms()
-
-    def clear_alert(self, key: str) -> None:
-        if key in self.active_alerts:
-            self.log(f"ALERT[{key}] CLEARED", level="INFO")
-            del self.active_alerts[key]
+    def log_event(self, event_type: str, payload: dict) -> None:
+        record = {"ts_ms": now_ms(), "type": event_type, **payload}
+        try:
+            self.jsonl_file.write(json.dumps(record, default=str) + "\n")
+        except Exception:
+            pass
 
     def next_detection_id(self) -> int:
         self._next_detection_id += 1
         return self._next_detection_id
-
-    def next_opportunity_id(self) -> int:
-        self._next_opportunity_id += 1
-        return self._next_opportunity_id
 
     def close(self) -> None:
         try:
             self.log_file.close()
         except Exception:
             pass
+        try:
+            self.jsonl_file.close()
+        except Exception:
+            pass
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CORE LOGIC — book validation, depth, deviation, fees
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# GHOST FILTERS (POR SNAPSHOT, NAO POR MERCADO)
+# ============================================================
 
-def is_outcome_ghost(o: OutcomeState) -> Tuple[bool, str]:
-    """Detecta book fantasma / terminal no nível do outcome. (bug #3)"""
-    if not o.bids and not o.asks:
-        return True, "empty_book"
-    if not o.asks or not o.bids:
-        return True, "one_sided_book"
-    bb, ba = o.best_bid, o.best_ask
+def filter_dust_levels(levels: list[BookLevel]) -> list[BookLevel]:
+    return [lvl for lvl in levels if lvl.notional >= MIN_LEVEL_NOTIONAL_USD]
+
+
+def outcome_passes_sanity(o: OutcomeState, cur_ms: int) -> tuple[bool, str]:
+    bb = o.best_bid
+    ba = o.best_ask
     if bb is None or ba is None:
-        return True, "no_best"
-    # Locked/crossed (bug #19)
-    if ba <= bb:
-        return True, "locked_or_crossed"
-    # Spread absurdo
-    if ba - bb > MAX_SPREAD:
-        return True, "wide_spread"
-    # Ghost clássico: ambos lados colapsados baixo
-    if ba <= GHOST_ASK_MAX and bb <= GHOST_BID_MAX:
-        return True, "ghost_low"
-    # Terminal: quase resolveu YES
-    if ba >= TERMINAL_ASK_MIN and bb >= TERMINAL_BID_MIN:
-        return True, "terminal_high"
-    # Depth mínimo
-    depth = o.depth_usd_top_n(5, side="ask")
-    if depth < MIN_DEPTH_USD_PER_OUTCOME:
-        return True, "thin_depth"
-    return False, ""
+        return False, "missing_bid_or_ask"
+    if bb >= ba:
+        return False, "locked_or_crossed"
+    spread = ba - bb
+    if spread > MAX_SPREAD_PER_OUTCOME:
+        return False, "spread_too_wide"
+    if ba <= GHOST_DUST_ASK and bb <= GHOST_DUST_BID:
+        return False, "ghost_dust"
+    if cur_ms - o.last_update_ms > STALENESS_MS:
+        return False, "stale"
+    non_dust_bids = filter_dust_levels(o.bids)
+    non_dust_asks = filter_dust_levels(o.asks)
+    if not non_dust_bids or not non_dust_asks:
+        return False, "all_levels_dust"
+    return True, ""
 
 
-def is_outcome_stale(o: OutcomeState, now: int) -> bool:
-    if not o.ever_updated:
-        return True
-    return (now - o.last_update_ms) > STALENESS_MS
-
-
-def compute_snapshot(ev: EventState, now: int) -> Tuple[Optional[BookSnapshot], str]:
+def compute_snapshot(ev: EventState, cur_ms: int) -> BookSnapshot:
     """
-    Retorna (snapshot, rejection_reason).
-    Snapshot=None → rejeitado. rejection_reason só para telemetria.
-
-    Bug #2: só gera snapshot se houve update real desde o último.
-    Bug #4: qualquer outcome stale em NegRisk rejeita o snapshot inteiro.
-    Bug #3/#8/#19: filtros de ghost/dust/locked por outcome.
+    Retorna rejected_snapshot=True se NegRisk nao esta saudavel.
     """
-    if not ev.is_active:
-        return None, "event_inactive"
-    if not ev.outcomes:
-        return None, "no_outcomes"
-
-    # Stale?
+    locked_count = sum(
+        1 for o in ev.outcomes
+        if o.best_bid is not None and o.best_ask is not None and o.best_bid >= o.best_ask
+    )
+    motivos: list[str] = []
     for o in ev.outcomes:
-        if not o.is_active:
-            return None, "outcome_inactive"
-        if is_outcome_stale(o, now):
-            return None, "stale_outcome"
+        ok, motivo = outcome_passes_sanity(o, cur_ms)
+        if not ok:
+            motivos.append(motivo)
 
-    # Ghost / terminal / locked?
+    if motivos:
+        return BookSnapshot(
+            timestamp_ms=cur_ms,
+            based_on_update_ts=max((o.last_update_ms for o in ev.outcomes), default=0),
+            sum_ask=Decimal("0"),
+            sum_bid=Decimal("0"),
+            total_book_depth_usd=Decimal("0"),
+            locked_outcomes=locked_count,
+            rejected_snapshot=True,
+        )
+
+    sum_ask = sum((o.best_ask for o in ev.outcomes), start=Decimal("0"))
+    sum_bid = sum((o.best_bid for o in ev.outcomes), start=Decimal("0"))
+
+    rejected = False
+    if not (SUM_BID_RANGE[0] <= sum_bid <= SUM_BID_RANGE[1]):
+        rejected = True
+    if sum_ask < sum_bid:
+        rejected = True
+
+    total_depth = Decimal("0")
     for o in ev.outcomes:
-        ghost, why = is_outcome_ghost(o)
-        if ghost:
-            return None, f"ghost_{why}"
+        for lvl in filter_dust_levels(o.bids):
+            total_depth += lvl.notional
+        for lvl in filter_dust_levels(o.asks):
+            total_depth += lvl.notional
 
-    # Agora seguro montar o snapshot
-    asks_tuple: List[Decimal] = []
-    bids_tuple: List[Decimal] = []
-    depths: List[Decimal] = []
-    fee_load = Decimal("0")
-
-    for o in ev.outcomes:
-        ba = o.best_ask  # type: ignore[assignment]
-        bb = o.best_bid  # type: ignore[assignment]
-        assert ba is not None and bb is not None  # is_outcome_ghost garantiu
-        asks_tuple.append(ba)
-        bids_tuple.append(bb)
-        depths.append(o.depth_usd_top_n(5, side="ask"))
-        # Fee load no mid-price do outcome: fee_rate * p * (1-p) por $1 notional
-        p_mid = (ba + bb) / 2
-        fee_load += ev.fee_rate * p_mid * (Decimal("1") - p_mid)
-
-    sum_ask = sum(asks_tuple, Decimal("0"))
-    sum_bid = sum(bids_tuple, Decimal("0"))
-    based_on = max(o.last_update_ms for o in ev.outcomes)
-
-    snap = BookSnapshot(
-        timestamp_ms=now,
-        based_on_update_ms=based_on,
+    based_on_update = max((o.last_update_ms for o in ev.outcomes), default=0)
+    return BookSnapshot(
+        timestamp_ms=cur_ms,
+        based_on_update_ts=based_on_update,
         sum_ask=sum_ask,
         sum_bid=sum_bid,
-        asks=tuple(asks_tuple),
-        bids=tuple(bids_tuple),
-        depth_usd_min=min(depths) if depths else Decimal("0"),
-        depth_usd_sum=sum(depths, Decimal("0")),
-        n_outcomes=len(ev.outcomes),
-        fee_load_per_usdc=fee_load,
+        total_book_depth_usd=total_depth,
+        locked_outcomes=locked_count,
+        rejected_snapshot=rejected,
     )
-    if not snap.is_valid():
-        return None, "snapshot_invalid"
-
-    return snap, ""
 
 
-def check_deviation(snap: BookSnapshot) -> Optional[Tuple[str, Decimal, Decimal]]:
-    """
-    Retorna (direction, gross_edge, net_edge_after_fees) se há oportunidade viável.
-    None caso contrário.
-
-    Bug #5 / #14: aplica fee load E threshold mínimo de net edge.
-    """
-    # LONG: comprar YES de todos os outcomes quando sum_ask < 1
+def check_deviation(snap: BookSnapshot) -> Optional[tuple[str, Decimal]]:
+    if snap.rejected_snapshot:
+        return None
     if snap.sum_ask < Decimal("1"):
-        gross = Decimal("1") - snap.sum_ask
-        if gross < MIN_GROSS_EDGE_RAW:
-            return None
-        net = gross - snap.fee_load_per_usdc
-        if net < MIN_NET_EDGE_AFTER_FEES:
-            return None
-        return ("LONG", gross, net)
-
-    # SHORT: split USDC + vender em todos quando sum_bid > 1
+        return ("LONG", Decimal("1") - snap.sum_ask)
     if snap.sum_bid > Decimal("1"):
-        gross = snap.sum_bid - Decimal("1")
-        if gross < MIN_GROSS_EDGE_RAW:
-            return None
-        net = gross - snap.fee_load_per_usdc
-        if net < MIN_NET_EDGE_AFTER_FEES:
-            return None
-        return ("SHORT", gross, net)
-
+        return ("SHORT", snap.sum_bid - Decimal("1"))
     return None
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# GAMMA DISCOVERY
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# WEBSOCKET — handlers
+# ============================================================
+
+def _parse_levels(raw_levels: list) -> list[BookLevel]:
+    out = []
+    for raw in raw_levels or []:
+        p = to_decimal(raw.get("price"))
+        s = to_decimal(raw.get("size"))
+        if p is None or s is None or s <= 0:
+            continue
+        out.append(BookLevel(price=p, size=s))
+    return out
+
+
+def _sort_levels(bids: list[BookLevel], asks: list[BookLevel]) -> tuple[list, list]:
+    return (
+        sorted(bids, key=lambda x: x.price, reverse=True),
+        sorted(asks, key=lambda x: x.price),
+    )
+
+
+def handle_book_event(lab: Lab, m: dict, ts: int) -> None:
+    aid = m.get("asset_id")
+    o = lab.token_to_outcome.get(aid)
+    if not o:
+        return
+    bids = _parse_levels(m.get("bids") or [])
+    asks = _parse_levels(m.get("asks") or [])
+    bids, asks = _sort_levels(bids, asks)
+    o.bids = bids
+    o.asks = asks
+    o.last_update_ms = ts
+
+
+def handle_best_bid_ask_event(lab: Lab, m: dict, ts: int) -> None:
+    """
+    Update apenas do top-of-book. Se o novo best nao bate com topo do
+    livro local, substituimos por placeholder; sera sobrescrito quando
+    vier proximo book completo.
+    """
+    aid = m.get("asset_id")
+    o = lab.token_to_outcome.get(aid)
+    if not o:
+        return
+    bb = to_decimal(m.get("best_bid"))
+    ba = to_decimal(m.get("best_ask"))
+    if bb is not None:
+        if not o.bids or o.bids[0].price != bb:
+            o.bids = [BookLevel(price=bb, size=Decimal("1.0"))]
+    if ba is not None:
+        if not o.asks or o.asks[0].price != ba:
+            o.asks = [BookLevel(price=ba, size=Decimal("1.0"))]
+    o.last_update_ms = ts
+
+
+def handle_price_change_event(lab: Lab, m: dict, ts: int) -> None:
+    """
+    Aplica deltas ao book local. CORRIGE BUG #9 DO V1 (que lia
+    best_bid/best_ask de um payload que nao tem esses campos).
+
+    Schema real:
+        {
+          "asset_id": "...",
+          "changes": [{"price": "...", "side": "BUY"|"SELL", "size": "..."}]
+        }
+    side BUY = bid, SELL = ask. size=0 remove level.
+    """
+    aid = m.get("asset_id")
+    o = lab.token_to_outcome.get(aid)
+    if not o:
+        return
+    changes = m.get("changes") or m.get("price_changes") or []
+    if not changes:
+        return
+    bids_by_price = {lvl.price: lvl for lvl in o.bids}
+    asks_by_price = {lvl.price: lvl for lvl in o.asks}
+    for ch in changes:
+        p = to_decimal(ch.get("price"))
+        s = to_decimal(ch.get("size"))
+        side = (ch.get("side") or "").upper()
+        if p is None or s is None:
+            continue
+        if side in ("BUY", "BID"):
+            if s == 0:
+                bids_by_price.pop(p, None)
+            else:
+                bids_by_price[p] = BookLevel(price=p, size=s)
+        elif side in ("SELL", "ASK"):
+            if s == 0:
+                asks_by_price.pop(p, None)
+            else:
+                asks_by_price[p] = BookLevel(price=p, size=s)
+    bids, asks = _sort_levels(list(bids_by_price.values()), list(asks_by_price.values()))
+    o.bids = bids
+    o.asks = asks
+    o.last_update_ms = ts
+
+
+def normalize_ws_timestamp(raw: Any) -> int:
+    """
+    Polymarket CLOB WS pode mandar timestamp em SEGUNDOS (string), nao ms.
+    Observacao empirica (run de 20/abr/2026): 68k rejeicoes stale_outcome em
+    12min com STALENESS_MS=30000 -- confirma s, nao ms.
+
+    Threshold 10^11: abaixo -> segundos (multiplica por 1000). Unix ts
+    atual em s ~1.8e9, em ms ~1.8e12. Qualquer valor abaixo de 10^11
+    so poderia ser ms se fosse ano ~5138, entao eh seguro tratar como s.
+    """
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return now_ms()
+    if val <= 0:
+        return now_ms()
+    if val < 10**11:
+        val *= 1000
+    return val
+
+
+def process_ws_message(lab: Lab, m: dict, conn_id: int) -> None:
+    et = m.get("event_type")
+    ts = normalize_ws_timestamp(m.get("timestamp"))
+    stats = lab.conn_stats[conn_id]
+    stats["events"] += 1
+    stats["last_event_ms"] = ts
+    if et == "book":
+        handle_book_event(lab, m, ts)
+    elif et == "best_bid_ask":
+        handle_best_bid_ask_event(lab, m, ts)
+    elif et == "price_change":
+        handle_price_change_event(lab, m, ts)
+
+
+async def reader_task(lab: Lab, tokens_chunk: list, conn_id: int, deadline: float) -> None:
+    sub_msg = {"assets_ids": tokens_chunk, "type": "market"}
+    lab.ws_subscriptions[conn_id] = tokens_chunk
+    backoff = 1.0
+    connected_since: Optional[float] = None
+    shutdown = lab.ensure_shutdown_event()
+
+    while time.time() < deadline and not shutdown.is_set():
+        try:
+            async with websockets.connect(
+                CLOB_WS,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=10 * 1024 * 1024,
+                close_timeout=5,
+            ) as ws:
+                await ws.send(json.dumps(sub_msg))
+                connected_since = time.time()
+                backoff = 1.0
+                while time.time() < deadline and not shutdown.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        if connected_since and (time.time() - connected_since) > 60:
+                            backoff = 1.0
+                        continue
+                    except ConnectionClosed as exc:
+                        lab.log(f"[conn {conn_id}] WS closed: {exc}", level="WARN")
+                        break
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        lab.log(f"[conn {conn_id}] JSON decode: {exc}", level="WARN")
+                        continue
+                    msgs = data if isinstance(data, list) else [data]
+                    for m in msgs:
+                        if isinstance(m, dict):
+                            try:
+                                process_ws_message(lab, m, conn_id)
+                            except Exception as exc:
+                                lab.log(
+                                    f"[conn {conn_id}] proc error: {type(exc).__name__}: {exc}",
+                                    level="WARN",
+                                )
+        except Exception as exc:
+            lab.conn_stats[conn_id]["reconnects"] += 1
+            lab.log(
+                f"[conn {conn_id}] reconnect caused by {type(exc).__name__}: {exc}",
+                level="WARN",
+            )
+
+        if time.time() < deadline and not shutdown.is_set():
+            sleep_sec = min(backoff, 60.0)
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=sleep_sec)
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, 60.0)
+
+
+# ============================================================
+# SNAPSHOT LOOP (registra so quando update real mudou, fix bug #2)
+# ============================================================
+
+async def snapshot_task(lab: Lab, deadline: float) -> None:
+    last_registered_ts: dict[int, int] = {}
+    shutdown = lab.ensure_shutdown_event()
+
+    while time.time() < deadline and not shutdown.is_set():
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=SNAPSHOT_INTERVAL_SEC)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        cur_ms = now_ms()
+        for ev in lab.events:
+            snap = compute_snapshot(ev, cur_ms)
+            last_ts = last_registered_ts.get(ev.idx, -1)
+            if snap.based_on_update_ts > last_ts:
+                lab.snapshot_history[ev.idx].append(snap)
+                last_registered_ts[ev.idx] = snap.based_on_update_ts
+
+
+# ============================================================
+# DETECTOR + EDGE DECAY
+# ============================================================
+
+async def measure_decay(
+    lab: Lab,
+    det_id: int,
+    event_idx: int,
+    direction: str,
+    detection_ts_ms: int,
+    target_ms: int,
+) -> None:
+    lab._active_decay_tasks += 1
+    shutdown = lab.ensure_shutdown_event()
+    try:
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=target_ms / 1000.0)
+            return  # shutdown antes do target
+        except asyncio.TimeoutError:
+            pass
+
+        measured_at = now_ms()
+        target_ts = detection_ts_ms + target_ms
+        history = lab.snapshot_history.get(event_idx)
+
+        book_source_update: Optional[int] = None
+        available = False
+        surviving_gross: Optional[Decimal] = None
+        direction_matches = False
+
+        if history:
+            # Exige snapshot baseado em update REAL pos-detecao
+            candidates = [
+                s for s in history
+                if s.based_on_update_ts > detection_ts_ms
+                and s.timestamp_ms <= target_ts + 500
+                and not s.rejected_snapshot
+            ]
+            if candidates:
+                best = candidates[-1]
+                book_source_update = best.based_on_update_ts
+                available = True
+                dev = check_deviation(best)
+                if dev is None:
+                    surviving_gross = Decimal("0")
+                    direction_matches = False
+                else:
+                    new_dir, new_edge = dev
+                    if new_dir == direction:
+                        surviving_gross = new_edge
+                        direction_matches = True
+                    else:
+                        surviving_gross = Decimal("0")
+                        direction_matches = False
+
+        lab.decays.append(
+            DecayMeasurement(
+                detection_id=det_id,
+                target_ms=target_ms,
+                measured_at_ms=measured_at,
+                book_source_update_ms=book_source_update,
+                book_available=available,
+                surviving_gross_edge=(
+                    float(surviving_gross) if surviving_gross is not None else None
+                ),
+                surviving_direction_matches=direction_matches,
+            )
+        )
+    finally:
+        lab._active_decay_tasks = max(0, lab._active_decay_tasks - 1)
+
+
+def opportunity_should_fire(
+    lab: Lab,
+    event_idx: int,
+    direction: str,
+    cur_ms: int,
+) -> bool:
+    """Fix bug #13. So fire se (nao aberta) E (passou gap minimo desde fechamento)."""
+    key = (event_idx, direction)
+    if key in lab.open_opportunities:
+        return False
+    last_close = lab.last_close_ms.get(key, 0)
+    if cur_ms - last_close < MIN_OPPORTUNITY_GAP_MS:
+        return False
+    return True
+
+
+async def detector_task(lab: Lab, deadline: float) -> None:
+    shutdown = lab.ensure_shutdown_event()
+    while time.time() < deadline and not shutdown.is_set():
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=DETECTION_INTERVAL_SEC)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        if lab._active_decay_tasks > MAX_ACTIVE_DECAY_TASKS:
+            continue
+
+        cur_ms = now_ms()
+        for ev in lab.events:
+            history = lab.snapshot_history.get(ev.idx)
+            if not history:
+                continue
+            snap = history[-1]
+            dev = check_deviation(snap)
+
+            # Fechar oportunidades abertas que nao persistem mais
+            for direction in ("LONG", "SHORT"):
+                key = (ev.idx, direction)
+                if key in lab.open_opportunities:
+                    open_det = lab.open_opportunities[key]
+                    open_det.persisted_ticks += 1
+                    still_open = dev is not None and dev[0] == direction
+                    if not still_open:
+                        open_det.closed_at_ms = cur_ms
+                        lab.last_close_ms[key] = cur_ms
+                        del lab.open_opportunities[key]
+
+            # Criar nova deteccao se edge valido e nao ha aberta
+            if dev is None:
+                continue
+            direction, gross_edge = dev
+            if gross_edge < MIN_GROSS_EDGE:
+                continue
+            if not opportunity_should_fire(lab, ev.idx, direction, cur_ms):
+                continue
+
+            fee_load = fee_load_approx(ev.fee_rate, len(ev.outcomes))
+            net_edge = gross_edge - fee_load
+
+            det = DetectionRecord(
+                detection_id=lab.next_detection_id(),
+                detected_at_ms=cur_ms,
+                event_idx=ev.idx,
+                event_title=ev.title,
+                category=ev.category,
+                fee_rate=float(ev.fee_rate),
+                n_outcomes=len(ev.outcomes),
+                volume_bucket=ev.volume_bucket_label,
+                time_bucket_label=time_bucket(float(ev.days_until_resolution) * 24),
+                days_until_resolution=float(ev.days_until_resolution),
+                direction=direction,
+                initial_sum_ask=float(snap.sum_ask),
+                initial_sum_bid=float(snap.sum_bid),
+                initial_gross_edge=float(gross_edge),
+                initial_fee_load_approx=float(fee_load),
+                initial_net_edge=float(net_edge),
+                book_depth_usd=float(snap.total_book_depth_usd),
+                book_depth_bucket=book_depth_bucket(snap.total_book_depth_usd),
+                persisted_ticks=1,
+            )
+            lab.detections.append(det)
+            lab.open_opportunities[(ev.idx, direction)] = det
+            lab.log_event("detection", {
+                "id": det.detection_id,
+                "event": ev.title[:60],
+                "dir": direction,
+                "gross": float(gross_edge),
+                "net": float(net_edge),
+                "depth": float(snap.total_book_depth_usd),
+            })
+
+            for target in DECAY_TARGETS_MS:
+                asyncio.create_task(
+                    measure_decay(lab, det.detection_id, ev.idx, direction, cur_ms, target)
+                )
+
+
+# ============================================================
+# GAMMA DISCOVERY + RE-DISCOVERY
+# ============================================================
 
 async def fetch_all_events() -> list:
-    collected = []
+    collected: list = []
     offset = 0
     async with httpx.AsyncClient(base_url=GAMMA, timeout=30) as c:
         for _ in range(10):
-            r = await c.get(
-                "/events",
-                params={
-                    "limit": 200,
-                    "offset": offset,
-                    "active": "true",
-                    "closed": "false",
-                    "order": "volume",
-                    "ascending": "false",
-                },
-            )
+            r = await c.get("/events", params={
+                "limit": 200, "offset": offset,
+                "active": "true", "closed": "false",
+                "order": "volume", "ascending": "false",
+            })
             r.raise_for_status()
             batch = r.json()
             if not batch:
@@ -736,22 +965,21 @@ async def fetch_all_events() -> list:
 def event_passes_filters(ev: dict) -> bool:
     markets = ev.get("markets") or []
     n = len(markets)
-    if n < MIN_OUTCOMES_NEGRISK or n > MAX_OUTCOMES:
+    if n < MIN_OUTCOMES or n > MAX_OUTCOMES:
         return False
     if not all(m.get("negRisk") for m in markets):
         return False
-    # Bug #6: default False, não True
     tradable = all(
         m.get("enableOrderBook")
-        and m.get("acceptingOrders", False)
+        and m.get("acceptingOrders", False)  # bug #6: default False em vez de True
         and not m.get("closed")
-        and m.get("active", False)
+        and m.get("active", True)
         for m in markets
     )
     if not tradable:
         return False
     vol = d(ev.get("volume")) or Decimal("0")
-    if not (VOL_MIN <= vol <= VOL_MAX):
+    if not (VOL_MIN_TOTAL <= vol <= VOL_MAX_TOTAL):
         return False
     end_dt = parse_end_date(ev.get("endDate"))
     days_val = days_until(end_dt)
@@ -761,23 +989,18 @@ def event_passes_filters(ev: dict) -> bool:
 
 
 def select_diverse_markets(eligible: list, n_target: int) -> list:
-    """Seleciona mercados diversos por (volume_bucket × categoria),
-    round-robin para garantir cobertura."""
-    by_group: Dict[Tuple[str, str], list] = defaultdict(list)
+    by_group: dict[tuple[str, str], list] = defaultdict(list)
     for ev in eligible:
         vol = d(ev.get("volume")) or Decimal("0")
-        vb = volume_bucket(vol)
         cat = infer_category(ev.get("tags") or [])
-        by_group[(vb, cat)].append(ev)
+        by_group[(volume_bucket(vol), cat)].append(ev)
     for key in by_group:
         by_group[key].sort(key=lambda e: -float(d(e.get("volume")) or 0))
 
-    selected: list = []
-    group_keys = list(by_group.keys())
-    idx_per_group: Dict[Tuple[str, str], int] = defaultdict(int)
-    max_rounds = 20
-    for _ in range(max_rounds):
-        for key in group_keys:
+    selected = []
+    idx_per_group: dict[tuple[str, str], int] = defaultdict(int)
+    for _ in range(20):
+        for key in list(by_group.keys()):
             if len(selected) >= n_target:
                 break
             idx = idx_per_group[key]
@@ -789,826 +1012,291 @@ def select_diverse_markets(eligible: list, n_target: int) -> list:
     return selected
 
 
-async def rediscover_and_mark_inactive(lab: Lab) -> Tuple[int, int]:
+async def rediscovery_task(lab: Lab, deadline: float) -> None:
     """
-    Re-consulta Gamma. Marca como inactive eventos que:
-      - não aparecem mais na lista de ativos
-      - aparecem mas com closed=True ou algum market não-tradable
-    Retorna (n_deactivated, n_checked).
-
-    Não remove do universo (complicaria WS re-sub); só flagga para ignorar
-    em compute_snapshot. Bug #26.
+    A cada REDISCOVERY_INTERVAL_SEC, verifica se mercados selecionados
+    ainda estao ativos/tradable. Loga taxa de mortalidade (nao troca
+    universo on-the-fly -- exigiria re-inscrever WS).
     """
-    try:
-        all_events = await fetch_all_events()
-    except Exception as exc:
-        lab.log(f"re-discovery FAILED: {type(exc).__name__}: {exc}", level="WARN")
-        return (0, 0)
-
-    live_ids = set(str(ev.get("id", "")) for ev in all_events)
-    live_by_id = {str(ev.get("id", "")): ev for ev in all_events}
-
-    # Nossos eventos têm o id original salvo? Precisamos mapear idx → event_id
-    # Vamos salvar no title_full + usar outra via. Como os slug/title são
-    # únicos o suficiente, usamos slug.
-    n_deactivated = 0
-    n_checked = 0
-    for ev in lab.events:
-        if not ev.is_active:
-            continue
-        n_checked += 1
-        # Tenta match por slug
-        matched = None
-        for live in all_events:
-            if live.get("slug") == ev.slug:
-                matched = live
-                break
-        if matched is None:
-            ev.is_active = False
-            for o in ev.outcomes:
-                o.is_active = False
-            n_deactivated += 1
-            continue
-        # Se achou mas virou não-tradable, desativa
-        if not event_passes_filters(matched):
-            # Pode não passar por volume range (já estava no universo), então
-            # checa só as flags críticas:
-            markets = matched.get("markets") or []
-            still_tradable = all(
-                m.get("enableOrderBook")
-                and m.get("acceptingOrders", False)
-                and not m.get("closed")
-                and m.get("active", False)
-                for m in markets
-            ) if markets else False
-            if not still_tradable or matched.get("closed"):
-                ev.is_active = False
-                for o in ev.outcomes:
-                    o.is_active = False
-                n_deactivated += 1
-    return (n_deactivated, n_checked)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# WEBSOCKET — message handling with correct price_change semantics
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _parse_book_levels(raw_list: Any) -> List[BookLevel]:
-    """Parse levels do evento `book`. Formato: [{price, size}, ...]."""
-    out: List[BookLevel] = []
-    if not isinstance(raw_list, list):
-        return out
-    for lv in raw_list:
-        if not isinstance(lv, dict):
-            continue
-        p = d(lv.get("price"))
-        s = d(lv.get("size"))
-        if p is None or s is None or s <= 0 or p <= 0 or p >= 1:
-            continue
-        out.append(BookLevel(price=p, size=s))
-    return out
-
-
-def process_message(lab: Lab, m: dict, conn_id: int) -> None:
-    et = m.get("event_type")
-    ts_raw = m.get("timestamp")
-    try:
-        ts = int(ts_raw) if ts_raw is not None else now_ms()
-    except (TypeError, ValueError):
-        ts = now_ms()
-
-    lab.conn_stats[conn_id]["events"] += 1
-    lab.ws_events_by_type[et or "unknown"] += 1
-
-    if et == "book":
-        aid = m.get("asset_id")
-        o = lab.token_to_outcome.get(aid)
-        if not o:
-            return
-        bids = _parse_book_levels(m.get("bids"))
-        asks = _parse_book_levels(m.get("asks"))
-        o.rebuild_from_snapshot(bids, asks, ts)
-
-    elif et == "price_change":
-        # Payload real: {asset_id, market, changes: [{price, side, size}], hash, ...}
-        # Bug #9 corrigido: aplica deltas ao book local.
-        aid = m.get("asset_id")
-        o = lab.token_to_outcome.get(aid)
-        if not o:
-            # Alguns feeds mandam asset_id dentro de cada change; tenta isso.
-            changes = m.get("changes") or m.get("price_changes") or []
-            if isinstance(changes, list) and changes:
-                for ch in changes:
-                    if not isinstance(ch, dict):
-                        continue
-                    inner_aid = ch.get("asset_id")
-                    o2 = lab.token_to_outcome.get(inner_aid) if inner_aid else None
-                    if o2 is None:
-                        continue
-                    p = d(ch.get("price"))
-                    s = d(ch.get("size"))
-                    side = ch.get("side")
-                    if p is None or s is None or side is None:
-                        continue
-                    o2.apply_price_change(side, p, s, ts)
-            return
-        changes = m.get("changes") or m.get("price_changes") or []
-        if not isinstance(changes, list):
-            return
-        for ch in changes:
-            if not isinstance(ch, dict):
-                continue
-            p = d(ch.get("price"))
-            s = d(ch.get("size"))
-            side = ch.get("side")
-            if p is None or s is None or side is None:
-                continue
-            o.apply_price_change(side, p, s, ts)
-
-    elif et == "best_bid_ask":
-        # Não usamos best_bid_ask para atualizar book (perderíamos níveis
-        # profundos). Só um sinal de "algo mudou" — já temos ts do evento.
-        # Optamos por IGNORAR explicitamente (o book já é mantido por
-        # `book` e `price_change`).
-        return
-
-    elif et == "last_trade_price":
-        # Não muda estado do book; só info
-        return
-
-
-async def reader_task(lab: Lab, tokens_chunk: List[str], conn_id: int,
-                      deadline: float) -> None:
-    """Reader WS com reconexão exponencial e log explícito de erros (bug #20/21)."""
-    sub_msg = {
-        "assets_ids": tokens_chunk,
-        "type": "market",
-        "custom_feature_enabled": True,
-    }
-    backoff = 1.0
-    BACKOFF_MAX = 60.0
-    STABLE_CONNECTION_SEC = 30  # resetar backoff após 30s estável
-
-    while time.time() < deadline and not lab.shutdown_event.is_set():
-        connected_at: Optional[float] = None
+    shutdown = lab.ensure_shutdown_event()
+    while time.time() < deadline and not shutdown.is_set():
         try:
-            async with websockets.connect(
-                CLOB_WS, ping_interval=20, max_size=10 * 1024 * 1024
-            ) as ws:
-                await ws.send(json.dumps(sub_msg))
-                connected_at = time.time()
-                # Reset do backoff só DEPOIS de conectar + enviar sub
-                backoff = 1.0
-                while time.time() < deadline and not lab.shutdown_event.is_set():
-                    # Reset do backoff se conexão já está estável
-                    if (connected_at is not None
-                            and time.time() - connected_at > STABLE_CONNECTION_SEC):
-                        backoff = 1.0
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        continue
-                    except ConnectionClosed as exc:
-                        lab.log(
-                            f"[conn {conn_id}] ConnectionClosed: "
-                            f"code={exc.code if hasattr(exc, 'code') else '?'}",
-                            level="WARN",
-                        )
-                        break
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    msgs = data if isinstance(data, list) else [data]
-                    for msg in msgs:
-                        if isinstance(msg, dict):
-                            try:
-                                process_message(lab, msg, conn_id)
-                            except Exception as exc:
-                                lab.log(
-                                    f"[conn {conn_id}] process_message error: "
-                                    f"{type(exc).__name__}: {exc}",
-                                    level="WARN",
-                                )
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            lab.conn_stats[conn_id]["reconnects"] += 1
+            await asyncio.wait_for(shutdown.wait(), timeout=REDISCOVERY_INTERVAL_SEC)
+            break
+        except asyncio.TimeoutError:
+            pass
+        try:
+            all_events = await fetch_all_events()
+            eligible_ids = {str(ev.get("id")) for ev in all_events if event_passes_filters(ev)}
+            try:
+                with open(lab.output_dir / "markets.json") as f:
+                    selected_info = json.load(f)
+            except Exception:
+                selected_info = []
+            still_active = sum(1 for info in selected_info if info.get("event_id") in eligible_ids)
+            total = len(selected_info)
+            mortality_pct = 0.0 if total == 0 else (1 - still_active / total) * 100
             lab.log(
-                f"[conn {conn_id}] reconnect caused by "
-                f"{type(exc).__name__}: {str(exc)[:200]}",
-                level="WARN",
+                f"[REDISCOVERY] {still_active}/{total} mercados ativos "
+                f"({mortality_pct:.1f}% mortalidade)"
             )
-
-        # Shutdown check antes do sleep
-        if lab.shutdown_event.is_set() or time.time() >= deadline:
-            return
-        try:
-            await asyncio.wait_for(
-                lab.shutdown_event.wait(), timeout=min(backoff, BACKOFF_MAX)
-            )
-        except asyncio.TimeoutError:
-            pass
-        backoff = min(backoff * 2, BACKOFF_MAX)
+            lab.log_event("rediscovery", {
+                "still_active": still_active,
+                "total": total,
+                "mortality_pct": mortality_pct,
+            })
+        except Exception as exc:
+            lab.log(f"[REDISCOVERY] erro: {type(exc).__name__}: {exc}", level="WARN")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SNAPSHOT / DETECT / EDGE DECAY
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# PERSISTENCE (INCREMENTAL, CORRIGE BUG #15)
+# ============================================================
 
-async def snapshot_task(lab: Lab, deadline: float) -> None:
-    """
-    Gera snapshots só quando há update novo em algum outcome do evento.
-    Bug #2/#24 corrigidos: não spamma o histórico com cópias cacheadas.
-    """
-    # Por evento, guardamos o último `based_on_update_ms` que persistimos
-    last_based_on: Dict[int, int] = {}
-
-    while time.time() < deadline and not lab.shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(lab.shutdown_event.wait(), timeout=0.2)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        current_now = now_ms()
-        for ev in lab.events:
-            if not ev.is_active:
-                continue
-            if not ev.outcomes:
-                continue
-            # Cheap check: se nada mudou desde o último snapshot deste evento, pula.
-            latest_update = max(
-                (o.last_update_ms for o in ev.outcomes if o.ever_updated), default=0
-            )
-            if latest_update == 0:
-                continue
-            if latest_update == last_based_on.get(ev.idx, -1):
-                continue
-
-            snap, reason = compute_snapshot(ev, current_now)
-            if snap is None:
-                lab.rejection_counts[reason] += 1
-                continue
-            lab.snapshot_history[ev.idx].append(snap)
-            last_based_on[ev.idx] = latest_update
-
-
-def _find_snapshot_at_or_after(
-    history: Deque[BookSnapshot], target_ts: int,
-) -> Optional[BookSnapshot]:
-    """
-    Encontra o primeiro snapshot em `history` cujo `based_on_update_ms > target_ts`.
-    Ou seja: um snapshot baseado em update real que ocorreu depois de target_ts.
-    Bug #12: só vale se o book realmente atualizou depois da detecção.
-    """
-    for snap in history:
-        if snap.based_on_update_ms > target_ts:
-            return snap
-    return None
-
-
-async def measure_edge_decay(lab: Lab, det_id: int, event_idx: int,
-                             direction: str, detection_ts_ms: int,
-                             detection_based_on_ms: int,
-                             target_delay_ms: int) -> None:
-    """
-    Agenda medição de edge decay para +target_delay_ms após detecção.
-    Diferente do v1: só considera válida se houve update REAL do book no
-    intervalo. Não mede mais o próprio sleep (bug #11).
-    """
-    try:
-        await asyncio.wait_for(
-            lab.shutdown_event.wait(), timeout=target_delay_ms / 1000
-        )
-        return
-    except asyncio.TimeoutError:
-        pass
-
-    measured_at = now_ms()
-    elapsed = measured_at - detection_ts_ms
-    history = lab.snapshot_history.get(event_idx, deque())
-
-    # Snapshot baseado em update posterior à detecção
-    fresh_snap = _find_snapshot_at_or_after(history, detection_based_on_ms)
-
-    surviving_gross: Optional[Decimal] = None
-    surviving_net: Optional[Decimal] = None
-    had_real_update = fresh_snap is not None
-
-    if fresh_snap is not None:
-        dev = check_deviation(fresh_snap)
-        if dev is not None:
-            dir_new, gross_new, net_new = dev
-            if dir_new == direction:
-                surviving_gross = gross_new
-                surviving_net = net_new
-            else:
-                # direção mudou (ex.: LONG→SHORT) — edge da direção original zerou
-                surviving_gross = Decimal("0")
-                surviving_net = Decimal("0")
-        else:
-            surviving_gross = Decimal("0")
-            surviving_net = Decimal("0")
-
-    lab.decay_measurements.append(EdgeDecayMeasurement(
-        detection_id=det_id,
-        target_delay_ms=target_delay_ms,
-        measured_at_ms=measured_at,
-        elapsed_ms_actual=elapsed,
-        had_real_update_post_detection=had_real_update,
-        surviving_edge=surviving_gross,
-        surviving_net_edge=surviving_net,
-    ))
-
-    # Se completou todas as medições desta detecção, libera slot
-    measured_for_det = sum(
-        1 for m in lab.decay_measurements if m.detection_id == det_id
-    )
-    if measured_for_det >= len(EDGE_DECAY_TARGETS_MS):
-        lab.active_measurements.discard(det_id)
-
-
-async def detector_task(lab: Lab, deadline: float) -> None:
-    """
-    Varre eventos a cada DETECTION_INTERVAL_MS. Usa cooldown estendido com
-    detecção de reopen: mesma oportunidade (event, direction) só gera nova
-    detecção se desvio voltou a zero entre medições (bug #13).
-
-    Também registra close events quando desvio zera (bug #28).
-    """
-    # helper: registra fechamento se estava aberta
-    def _close_opportunity(ev_idx: int, direction: str, at_ms: int) -> None:
-        key = (ev_idx, direction)
-        state = lab.open_opportunities.get(key)
-        if state is None:
-            return
-        lab.detection_closes.append(DetectionClose(
-            detection_id=state["detection_id"],
-            opportunity_id=state["opportunity_id"],
-            opened_at_ms=state["opened_at_ms"],
-            closed_at_ms=at_ms,
-            duration_ms=at_ms - state["opened_at_ms"],
-            max_gross_edge_seen=state["max_gross_edge"],
-        ))
-        del lab.open_opportunities[key]
-
-    while time.time() < deadline and not lab.shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(
-                lab.shutdown_event.wait(), timeout=DETECTION_INTERVAL_MS / 1000
-            )
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        if len(lab.active_measurements) > MAX_ACTIVE_MEASUREMENTS:
-            continue
-
-        current = now_ms()
-        for ev in lab.events:
-            if not ev.is_active:
-                # Fecha qualquer oportunidade que estivesse aberta
-                for direction in ("LONG", "SHORT"):
-                    _close_opportunity(ev.idx, direction, current)
-                continue
-            history = lab.snapshot_history.get(ev.idx)
-            if not history:
-                continue
-            snap = history[-1]
-            deviation = check_deviation(snap)
-
-            # Para cada direção possível, checa se oportunidade está aberta ou
-            # deveria ser fechada.
-            for direction in ("LONG", "SHORT"):
-                is_active_this_dir = (
-                    deviation is not None and deviation[0] == direction
-                )
-                key = (ev.idx, direction)
-                state = lab.open_opportunities.get(key)
-
-                if state is None and not is_active_this_dir:
-                    continue  # nada acontecendo
-                if state is not None and not is_active_this_dir:
-                    # Estava aberta, agora fechou → registra close
-                    _close_opportunity(ev.idx, direction, current)
-                    continue
-                if state is not None and is_active_this_dir:
-                    # Ainda aberta; atualiza max_gross
-                    gross = deviation[1]  # type: ignore[index]
-                    if gross > state["max_gross_edge"]:
-                        state["max_gross_edge"] = gross
-                    # Respeita cooldown
-                    if current - state["opened_at_ms"] < DETECTION_COOLDOWN_MS:
-                        continue
-                    # Cooldown expirou → re-registra como nova detecção
-                    # dentro da mesma oportunidade (não incrementa opp_id)
-                    gross, net = deviation[1], deviation[2]  # type: ignore[index]
-                    _emit_detection(
-                        lab, ev, snap, direction, gross, net,
-                        opportunity_id=state["opportunity_id"],
-                        is_reopen=False,
-                        at_ms=current,
-                    )
-                    state["opened_at_ms"] = current  # re-arma cooldown
-                    continue
-                # state is None and is_active_this_dir: oportunidade nova
-                gross, net = deviation[1], deviation[2]  # type: ignore[index]
-                opp_id = lab.next_opportunity_id()
-                det_id = _emit_detection(
-                    lab, ev, snap, direction, gross, net,
-                    opportunity_id=opp_id,
-                    is_reopen=False,
-                    at_ms=current,
-                )
-                lab.open_opportunities[key] = {
-                    "detection_id": det_id,
-                    "opportunity_id": opp_id,
-                    "opened_at_ms": current,
-                    "max_gross_edge": gross,
-                }
-
-
-def _emit_detection(lab: Lab, ev: EventState, snap: BookSnapshot,
-                    direction: str, gross: Decimal, net: Decimal,
-                    opportunity_id: int, is_reopen: bool, at_ms: int) -> int:
-    """Cria DetectionRecord, agenda edge_decay measurements, retorna det_id."""
-    det_id = lab.next_detection_id()
-    rec = DetectionRecord(
-        detection_id=det_id,
-        opportunity_id=opportunity_id,
-        detected_at_ms=at_ms,
-        event_idx=ev.idx,
-        event_title=ev.title_full,
-        category=ev.category,
-        volume_bucket=ev.volume_bucket,
-        time_bucket_label=time_bucket_hours(float(ev.days_until_resolution) * 24),
-        direction=direction,
-        initial_sum_ask=snap.sum_ask,
-        initial_sum_bid=snap.sum_bid,
-        initial_gross_edge=gross,
-        fee_load_per_usdc=snap.fee_load_per_usdc,
-        initial_net_edge_after_fees=net,
-        is_economically_viable=(net >= MIN_NET_EDGE_AFTER_FEES),
-        depth_usd_min=snap.depth_usd_min,
-        depth_usd_sum=snap.depth_usd_sum,
-        depth_bucket=book_depth_bucket_usd(snap.depth_usd_min),
-        days_until_resolution=ev.days_until_resolution,
-        n_outcomes=ev.n_outcomes,
-        is_reopen=is_reopen,
-    )
-    lab.detections.append(rec)
-    for t_ms in EDGE_DECAY_TARGETS_MS:
-        asyncio.create_task(
-            measure_edge_decay(lab, det_id, ev.idx, direction,
-                               at_ms, snap.based_on_update_ms, t_ms)
-        )
-    lab.active_measurements.add(det_id)
-    return det_id
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PERSIST INCREMENTAL (bug #15)
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _detection_to_row(d: DetectionRecord) -> dict:
-    return {
-        "detection_id": d.detection_id,
-        "opportunity_id": d.opportunity_id,
-        "detected_at_ms": d.detected_at_ms,
-        "event_idx": d.event_idx,
-        "event_title": d.event_title,
-        "category": d.category,
-        "volume_bucket": d.volume_bucket,
-        "time_bucket": d.time_bucket_label,
-        "direction": d.direction,
-        "initial_sum_ask": float(d.initial_sum_ask),
-        "initial_sum_bid": float(d.initial_sum_bid),
-        "initial_gross_edge": float(d.initial_gross_edge),
-        "fee_load_per_usdc": float(d.fee_load_per_usdc),
-        "initial_net_edge_after_fees": float(d.initial_net_edge_after_fees),
-        "is_economically_viable": d.is_economically_viable,
-        "depth_usd_min": float(d.depth_usd_min),
-        "depth_usd_sum": float(d.depth_usd_sum),
-        "depth_bucket": d.depth_bucket,
-        "days_until_resolution": float(d.days_until_resolution),
-        "n_outcomes": d.n_outcomes,
-        "is_reopen": d.is_reopen,
-    }
-
-
-def _decay_to_row(m: EdgeDecayMeasurement) -> dict:
-    return {
-        "detection_id": m.detection_id,
-        "target_delay_ms": m.target_delay_ms,
-        "measured_at_ms": m.measured_at_ms,
-        "elapsed_ms_actual": m.elapsed_ms_actual,
-        "had_real_update_post_detection": m.had_real_update_post_detection,
-        "surviving_edge": float(m.surviving_edge) if m.surviving_edge is not None else None,
-        "surviving_net_edge": float(m.surviving_net_edge) if m.surviving_net_edge is not None else None,
-    }
-
-
-def _close_to_row(c: DetectionClose) -> dict:
-    return {
-        "detection_id": c.detection_id,
-        "opportunity_id": c.opportunity_id,
-        "opened_at_ms": c.opened_at_ms,
-        "closed_at_ms": c.closed_at_ms,
-        "duration_ms": c.duration_ms,
-        "max_gross_edge_seen": float(c.max_gross_edge_seen),
-    }
-
-
-def persist_incremental(lab: Lab, force_tag: Optional[str] = None) -> None:
-    """
-    Persiste APENAS o que foi adicionado desde o último checkpoint.
-    Bug #15 corrigido: v1 re-serializava tudo a cada batch (conta triangular).
-
-    Arquivos nomeados por timestamp legível. Análise post-hoc:
-        pd.concat([pd.read_parquet(f) for f in glob('detections_*.parquet')])
-    """
+def persist_incremental(lab: Lab, tag: str = "") -> None:
     if not HAS_PANDAS:
         return
-
-    tag = force_tag or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-    new_dets = lab.detections[lab._persisted_detection_idx:]
-    new_decays = lab.decay_measurements[lab._persisted_decay_idx:]
-    new_closes = lab.detection_closes[lab._persisted_close_idx:]
-
-    # Assert anti-regressão bug #15: batches incrementais não podem repetir ids
-    if new_dets:
-        ids = [r.detection_id for r in new_dets]
-        if len(set(ids)) != len(ids):
-            lab.raise_alert(
-                "BUG_15_REGRESSION",
-                f"IDs duplicados no batch {tag}: {len(ids)} rows, {len(set(ids))} únicos",
-            )
-
     try:
-        if new_dets:
-            rows = [_detection_to_row(x) for x in new_dets]
-            path = lab.output_dir / f"detections_{tag}.parquet"
-            pd.DataFrame(rows).to_parquet(path, index=False)
-            lab._persisted_detection_idx = len(lab.detections)
-        if new_decays:
-            rows = [_decay_to_row(x) for x in new_decays]
-            path = lab.output_dir / f"decay_{tag}.parquet"
-            pd.DataFrame(rows).to_parquet(path, index=False)
-            lab._persisted_decay_idx = len(lab.decay_measurements)
-        if new_closes:
-            rows = [_close_to_row(x) for x in new_closes]
-            path = lab.output_dir / f"closes_{tag}.parquet"
-            pd.DataFrame(rows).to_parquet(path, index=False)
-            lab._persisted_close_idx = len(lab.detection_closes)
+        new_detections = lab.detections[lab._persisted_detections_cursor:]
+        new_decays = lab.decays[lab._persisted_decays_cursor:]
 
-        lab.persist_batch_counter += 1
-        lab.last_checkpoint_ts = time.time()
+        if not new_detections and not new_decays:
+            return
+
+        lab._persist_seq += 1
+        seq = lab._persist_seq
+        label = tag or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+
+        if new_detections:
+            df_d = pd.DataFrame([det.__dict__ for det in new_detections])
+            out = lab.output_dir / f"detections_{seq:04d}_{label}.parquet"
+            df_d.to_parquet(out, index=False)
+            lab._persisted_detections_cursor = len(lab.detections)
+
+        if new_decays:
+            df_l = pd.DataFrame([dec.__dict__ for dec in new_decays])
+            out = lab.output_dir / f"decays_{seq:04d}_{label}.parquet"
+            df_l.to_parquet(out, index=False)
+            lab._persisted_decays_cursor = len(lab.decays)
+
         lab.log(
-            f"checkpoint {tag}: +{len(new_dets)} det, "
-            f"+{len(new_decays)} decay, +{len(new_closes)} closes"
+            f"[PERSIST #{seq}] +{len(new_detections)} detecoes, "
+            f"+{len(new_decays)} decays (cursores: det={lab._persisted_detections_cursor}, "
+            f"dec={lab._persisted_decays_cursor})"
         )
     except Exception as exc:
-        lab.raise_alert(
-            "PERSIST_FAILED",
-            f"persist_incremental exception: {type(exc).__name__}: {exc}",
+        lab.log(
+            f"[PERSIST] erro: {type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+            level="ERROR",
         )
 
 
 async def persist_task(lab: Lab, deadline: float) -> None:
-    while time.time() < deadline and not lab.shutdown_event.is_set():
+    shutdown = lab.ensure_shutdown_event()
+    while time.time() < deadline and not shutdown.is_set():
         try:
-            await asyncio.wait_for(
-                lab.shutdown_event.wait(), timeout=CHECKPOINT_INTERVAL_SEC
-            )
-            return
+            await asyncio.wait_for(shutdown.wait(), timeout=PERSIST_INTERVAL_SEC)
+            break
         except asyncio.TimeoutError:
             pass
         persist_incremental(lab)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STATUS.JSON (amigável pra cat remoto sem TTY)
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# STATUS / SANITY ALERTS
+# ============================================================
 
-def _percentile(values: List[float], p: float) -> Optional[float]:
-    if not values:
-        return None
-    s = sorted(values)
-    k = max(0, min(len(s) - 1, int(len(s) * p)))
-    return s[k]
+def _rolling_detections(lab: Lab, window_sec: int) -> list[DetectionRecord]:
+    cutoff = now_ms() - window_sec * 1000
+    return [d for d in lab.detections if d.detected_at_ms >= cutoff]
 
 
-def compute_status(lab: Lab) -> dict:
-    now = now_ms()
-    elapsed_sec = (time.time() - lab.start_time) if lab.start_time else 0.0
+def compute_sanity_alerts(lab: Lab) -> dict[str, str]:
+    alerts: dict[str, str] = {}
+    recent = _rolling_detections(lab, ALERT_ROLLING_WINDOW_SEC)
+    n = len(recent)
 
-    # Edge stats dos últimos N minutos
-    lookback_ms = 60 * 60 * 1000  # 1h rolling
-    recent = [d for d in lab.detections if now - d.detected_at_ms <= lookback_ms]
-    all_gross = [float(d.initial_gross_edge) for d in lab.detections]
-    recent_gross = [float(d.initial_gross_edge) for d in recent]
+    if n >= 20:
+        edges = sorted(r.initial_gross_edge for r in recent)
+        p90 = edges[int(0.9 * len(edges))]
+        if p90 > float(ALERT_P90_EDGE_THRESHOLD):
+            alerts["edge_p90_high"] = (
+                f"P90 gross edge = {p90:.2%} em {n} detecoes (ultimos "
+                f"{ALERT_ROLLING_WINDOW_SEC//60}min)"
+            )
 
-    # Bucket stats
-    depth_buckets = Counter(d.depth_bucket for d in lab.detections)
-    total_dets = max(1, len(lab.detections))
+    if n >= 20:
+        event_counts = Counter(r.event_idx for r in recent)
+        top_idx, top_count = event_counts.most_common(1)[0]
+        frac = top_count / n
+        if frac > ALERT_EVENT_CONCENTRATION:
+            alerts["event_concentration"] = (
+                f"Event idx={top_idx} tem {frac:.1%} das ultimas {n} detecoes"
+            )
 
-    # Checkpoint idade
-    cp_age_sec = (
-        (time.time() - lab.last_checkpoint_ts) if lab.last_checkpoint_ts else None
-    )
+    if n >= 20:
+        bucket_counts = Counter(r.book_depth_bucket for r in recent)
+        top_bucket, top_count = bucket_counts.most_common(1)[0]
+        frac = top_count / n
+        if frac > ALERT_BUCKET_CONCENTRATION:
+            alerts["bucket_concentration"] = (
+                f"Bucket '{top_bucket}' tem {frac:.1%} das ultimas {n} detecoes"
+            )
 
-    # Re-discovery state
-    n_active_events = sum(1 for e in lab.events if e.is_active)
-    n_deactivated = len(lab.events) - n_active_events
-
-    # Event type breakdown
-    ws_types = dict(lab.ws_events_by_type)
-
-    # Edge decay aggregate: % com update real por target
-    decay_stats: Dict[str, dict] = {}
-    for target in EDGE_DECAY_TARGETS_MS:
-        slice_ = [m for m in lab.decay_measurements if m.target_delay_ms == target]
-        if not slice_:
+    # Locked books nos snapshots recentes
+    locked_total = 0
+    outcomes_total = 0
+    cutoff = now_ms() - 30_000
+    for ev in lab.events:
+        hist = lab.snapshot_history.get(ev.idx)
+        if not hist:
             continue
-        with_update = sum(1 for m in slice_ if m.had_real_update_post_detection)
-        decay_stats[f"{target}ms"] = {
-            "n": len(slice_),
-            "had_real_update_pct": round(100 * with_update / len(slice_), 1),
-        }
-
-    return {
-        "timestamp": utc_iso(),
-        "elapsed_hours": round(elapsed_sec / 3600, 2),
-        "duration_hours_total": round(lab.duration_sec / 3600, 2),
-        "pct_complete": round(100 * elapsed_sec / max(1, lab.duration_sec), 1),
-
-        "detections_total": len(lab.detections),
-        "detections_last_hour": len(recent),
-        "detections_viable_total": sum(1 for d in lab.detections if d.is_economically_viable),
-        "opportunities_opened": lab._next_opportunity_id,
-        "opportunities_closed": len(lab.detection_closes),
-        "opportunities_open_now": len(lab.open_opportunities),
-
-        "gross_edge_median_pct": round(100 * median(all_gross), 4) if all_gross else None,
-        "gross_edge_p90_pct": round(100 * _percentile(all_gross, 0.9), 4) if all_gross else None,
-        "gross_edge_p99_pct": round(100 * _percentile(all_gross, 0.99), 4) if all_gross else None,
-        "gross_edge_max_pct": round(100 * max(all_gross), 4) if all_gross else None,
-        "gross_edge_recent_p90_pct": round(100 * _percentile(recent_gross, 0.9), 4) if recent_gross else None,
-
-        "depth_bucket_distribution_pct": {
-            k: round(100 * v / total_dets, 1) for k, v in depth_buckets.items()
-        },
-
-        "ws_events_total": sum(s["events"] for s in lab.conn_stats.values()),
-        "ws_reconnects_total": sum(s["reconnects"] for s in lab.conn_stats.values()),
-        "ws_events_by_type": ws_types,
-
-        "events_universe_total": len(lab.events),
-        "events_active": n_active_events,
-        "events_deactivated_by_rediscovery": n_deactivated,
-
-        "last_checkpoint_seconds_ago": round(cp_age_sec, 1) if cp_age_sec is not None else None,
-        "checkpoint_count": lab.persist_batch_counter,
-
-        "snapshot_rejection_top5": dict(lab.rejection_counts.most_common(5)),
-        "edge_decay_stats": decay_stats,
-
-        "alerts_active": sorted(lab.active_alerts.keys()),
-    }
+        recent_snaps = [s for s in hist if s.timestamp_ms >= cutoff]
+        for s in recent_snaps:
+            locked_total += s.locked_outcomes
+            outcomes_total += len(ev.outcomes)
+    if outcomes_total > 100:
+        rate = locked_total / outcomes_total
+        if rate > ALERT_LOCKED_BOOK_RATE:
+            alerts["locked_book_rate"] = (
+                f"Taxa de locked books = {rate:.1%} (amostras: {outcomes_total})"
+            )
+    return alerts
 
 
 async def status_task(lab: Lab, deadline: float) -> None:
-    status_path = lab.output_dir / "status.json"
-    last_console_log = 0.0
-    while time.time() < deadline and not lab.shutdown_event.is_set():
+    shutdown = lab.ensure_shutdown_event()
+    while time.time() < deadline and not shutdown.is_set():
         try:
-            await asyncio.wait_for(lab.shutdown_event.wait(), timeout=STATUS_INTERVAL_SEC)
-            return
+            await asyncio.wait_for(shutdown.wait(), timeout=STATUS_INTERVAL_SEC)
+            break
         except asyncio.TimeoutError:
             pass
 
-        status = compute_status(lab)
+        elapsed = time.time() - (lab.start_time or time.time())
+        total_ws = sum(s["events"] for s in lab.conn_stats.values())
+        reconnects = sum(s["reconnects"] for s in lab.conn_stats.values())
+
+        decay_by_target: dict[int, list[float]] = defaultdict(list)
+        for dec in lab.decays[-2000:]:
+            if dec.surviving_gross_edge is not None:
+                decay_by_target[dec.target_ms].append(dec.surviving_gross_edge)
+
+        decay_summary = {}
+        for t in DECAY_TARGETS_MS:
+            vals = decay_by_target.get(t, [])
+            decay_summary[f"{t}ms"] = {
+                "n": len(vals),
+                "median_surviving": (sorted(vals)[len(vals) // 2] if vals else None),
+            }
+
+        alerts = compute_sanity_alerts(lab)
+        for key, msg in alerts.items():
+            if key not in lab.active_alerts:
+                lab.log(f"[ALERT] {key}: {msg}", level="WARN")
+        for key in list(lab.active_alerts.keys()):
+            if key not in alerts:
+                lab.log(f"[ALERT CLEARED] {key}")
+        lab.active_alerts = alerts
+
+        status = {
+            "elapsed_min": round(elapsed / 60, 1),
+            "duration_min": round(lab.duration_sec / 60, 1),
+            "pct_done": round(100 * elapsed / lab.duration_sec, 1),
+            "ws_events_total": total_ws,
+            "ws_reconnects_total": reconnects,
+            "ws_conns": len(lab.conn_stats),
+            "events_monitored": len(lab.events),
+            "detections_total": len(lab.detections),
+            "detections_last_1h": len(_rolling_detections(lab, 3600)),
+            "open_opportunities": len(lab.open_opportunities),
+            "active_decay_tasks": lab._active_decay_tasks,
+            "decays_total": len(lab.decays),
+            "decay_summary": decay_summary,
+            "active_alerts": alerts,
+            "last_update_utc": datetime.now(timezone.utc).isoformat(),
+        }
         try:
-            tmp = status_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(status, indent=2))
-            tmp.replace(status_path)
+            tmp = lab.status_path.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(status, f, indent=2, default=str)
+            os.replace(tmp, lab.status_path)
         except Exception as exc:
-            lab.log(f"status.json write failed: {exc}", level="WARN")
+            lab.log(f"[STATUS] erro gravando status.json: {exc}", level="WARN")
 
-        # Log verboso a cada STATUS_CONSOLE_INTERVAL_SEC
-        if time.time() - last_console_log >= STATUS_CONSOLE_INTERVAL_SEC:
-            last_console_log = time.time()
-            lab.log(
-                f"[{status['elapsed_hours']:.2f}h / "
-                f"{status['duration_hours_total']:.0f}h] "
-                f"det={status['detections_total']} "
-                f"viable={status['detections_viable_total']} "
-                f"p90_edge={status['gross_edge_p90_pct']}% "
-                f"ws={status['ws_events_total']} "
-                f"reconn={status['ws_reconnects_total']} "
-                f"active_events={status['events_active']}/{status['events_universe_total']}"
-            )
-
-        # Sanity checks em tempo real
-        check_sanity_alerts(lab, status)
-
-
-def check_sanity_alerts(lab: Lab, status: dict) -> None:
-    """Aciona alertas se padrão de bug do v1 reaparecer."""
-    # 1. P90 edge absurdo
-    p90 = status.get("gross_edge_p90_pct")
-    if p90 is not None and p90 > float(ALERT_P90_EDGE_THRESHOLD) * 100:
-        lab.raise_alert(
-            "P90_EDGE_SUSPICIOUS",
-            f"gross_edge P90={p90}% > {float(ALERT_P90_EDGE_THRESHOLD)*100}% — possível ghost",
-        )
-    else:
-        lab.clear_alert("P90_EDGE_SUSPICIOUS")
-
-    # 2. Concentração de detecções em um único mercado (>50% em 1h)
-    now = now_ms()
-    lookback_ms = 60 * 60 * 1000
-    recent = [d for d in lab.detections if now - d.detected_at_ms <= lookback_ms]
-    if len(recent) >= 20:
-        per_event = Counter(d.event_idx for d in recent)
-        top_idx, top_count = per_event.most_common(1)[0]
-        if top_count / len(recent) > float(ALERT_CONCENTRATION_PCT):
-            lab.raise_alert(
-                "CONCENTRATION_HIGH",
-                f"event_idx={top_idx} concentrou {top_count}/{len(recent)} detecções em 1h",
-            )
-        else:
-            lab.clear_alert("CONCENTRATION_HIGH")
-
-    # 3. Dominância de bucket de depth
-    dist = status.get("depth_bucket_distribution_pct", {})
-    if dist:
-        max_bucket, max_pct = max(dist.items(), key=lambda kv: kv[1])
-        if max_pct > float(ALERT_BUCKET_DOMINANCE_PCT) * 100:
-            lab.raise_alert(
-                "DEPTH_BUCKET_DOMINANCE",
-                f"bucket {max_bucket} tem {max_pct}% — possível cálculo errado de depth",
-            )
-        else:
-            lab.clear_alert("DEPTH_BUCKET_DOMINANCE")
-
-    # 4. Checkpoint atrasado
-    cp_age = status.get("last_checkpoint_seconds_ago")
-    if cp_age is not None and cp_age > 2 * CHECKPOINT_INTERVAL_SEC:
-        lab.raise_alert(
-            "CHECKPOINT_STALE",
-            f"último checkpoint há {cp_age}s (esperado ≤{CHECKPOINT_INTERVAL_SEC}s)",
-        )
-    else:
-        lab.clear_alert("CHECKPOINT_STALE")
-
-
-async def rediscovery_task(lab: Lab, deadline: float) -> None:
-    """Re-valida universo a cada REDISCOVERY_INTERVAL_SEC (bug #26)."""
-    # Pula a primeira rodada (já veio de fetch inicial)
-    while time.time() < deadline and not lab.shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(
-                lab.shutdown_event.wait(), timeout=REDISCOVERY_INTERVAL_SEC
-            )
-            return
-        except asyncio.TimeoutError:
-            pass
-        n_deact, n_check = await rediscover_and_mark_inactive(lab)
         lab.log(
-            f"re-discovery: verificou {n_check} eventos, "
-            f"desativou {n_deact} (resolvidos/stopped)"
+            f"[{elapsed/60:.1f}min/{lab.duration_sec/60:.0f}min] "
+            f"ws={total_ws} rec={reconnects} det={len(lab.detections)} "
+            f"open={len(lab.open_opportunities)} alerts={len(alerts)}"
         )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN — bootstrap + orchestration
-# ═════════════════════════════════════════════════════════════════════════════
+# ============================================================
+# MAIN ORCHESTRATION
+# ============================================================
 
-def _build_events_from_selected(lab: Lab, selected: list) -> None:
-    for i, ev_raw in enumerate(selected):
-        cat = infer_category(ev_raw.get("tags") or [])
-        vol_total = d(ev_raw.get("volume")) or Decimal("0")
-        vol_24 = d(ev_raw.get("volume24hr")) or Decimal("0")
-        end_dt = parse_end_date(ev_raw.get("endDate"))
+async def run_simulation(lab: Lab) -> None:
+    lab.log("=== HFT Sim v2 ===")
+    lab.log(f"Duracao: {lab.duration_sec/3600:.1f}h")
+    lab.log(f"Mercados alvo: {lab.n_markets}")
+    lab.log(f"Output: {lab.output_dir}")
+
+    lab.log("Buscando events da Gamma API...")
+    all_events = await fetch_all_events()
+    lab.log(f"  {len(all_events)} events totais")
+
+    eligible = [ev for ev in all_events if event_passes_filters(ev)]
+    lab.log(f"  {len(eligible)} passaram filtros")
+
+    if len(eligible) < 10:
+        lab.log(f"ERRO: muito poucos elegiveis ({len(eligible)}).", level="ERROR")
+        return
+
+    selected = select_diverse_markets(eligible, lab.n_markets)
+    lab.log(f"  {len(selected)} selecionados para monitorar")
+
+    markets_info = []
+    for i, ev in enumerate(selected):
+        vol = float(d(ev.get("volume")) or 0)
+        cat = infer_category(ev.get("tags") or [])
+        end_dt = parse_end_date(ev.get("endDate"))
+        days_val = float(days_until(end_dt) or 0)
+        markets_info.append({
+            "idx": i,
+            "event_id": str(ev.get("id", "")),
+            "slug": ev.get("slug", ""),
+            "title": ev.get("title", ""),
+            "category": cat,
+            "fee_rate": float(fee_for(cat)),
+            "volume_total": vol,
+            "volume_bucket": volume_bucket(Decimal(str(vol))),
+            "days_until_resolution": days_val,
+            "n_outcomes": len(ev.get("markets", [])),
+        })
+    with open(lab.output_dir / "markets.json", "w") as f:
+        json.dump(markets_info, f, indent=2)
+
+    by_vol = Counter(m["volume_bucket"] for m in markets_info)
+    by_cat = Counter(m["category"] for m in markets_info)
+    lab.log(f"  Por volume: {dict(by_vol)}")
+    lab.log(f"  Por categoria: {dict(by_cat.most_common(6))}")
+
+    for i, ev in enumerate(selected):
+        cat = infer_category(ev.get("tags") or [])
+        vol = d(ev.get("volume")) or Decimal("0")
+        end_dt = parse_end_date(ev.get("endDate"))
         days_val = days_until(end_dt) or Decimal("0")
-        title_full = str(ev_raw.get("title", "") or "").strip() or "(no title)"
-        slug = str(ev_raw.get("slug", "") or "").strip()
-
         es = EventState(
             idx=i,
-            title_full=title_full,
+            title=(ev.get("title") or "")[:120],
             category=cat,
             fee_rate=fee_for(cat),
-            volume_total=vol_total,
-            volume_24h=vol_24,
+            volume=vol,
             outcomes=[],
             days_until_resolution=days_val,
-            volume_bucket=volume_bucket(vol_total),
-            slug=slug,
+            volume_bucket_label=volume_bucket(vol),
         )
-        for m in ev_raw.get("markets", []):
+        for m in ev.get("markets", []):
             tok_raw = m.get("clobTokenIds") or m.get("clob_token_ids")
             if isinstance(tok_raw, str):
                 try:
@@ -1617,170 +1305,83 @@ def _build_events_from_selected(lab: Lab, selected: list) -> None:
                     tok_raw = None
             if not tok_raw or len(tok_raw) < 2:
                 continue
-            question_full = str(m.get("question", "?") or "?")
             os_ = OutcomeState(
                 event_idx=i,
-                question=question_full,
+                question=(m.get("question") or "?"),
                 yes_token=str(tok_raw[0]),
             )
             es.outcomes.append(os_)
             lab.token_to_outcome[os_.yes_token] = os_
-        if len(es.outcomes) >= MIN_OUTCOMES_NEGRISK:
-            lab.events.append(es)
-
-
-def _save_markets_info(lab: Lab) -> None:
-    info = []
-    for ev in lab.events:
-        info.append({
-            "idx": ev.idx,
-            "slug": ev.slug,
-            "title": ev.title_full,
-            "category": ev.category,
-            "fee_rate": float(ev.fee_rate),
-            "volume_total": float(ev.volume_total),
-            "volume_24h": float(ev.volume_24h),
-            "volume_bucket": ev.volume_bucket,
-            "days_until_resolution": float(ev.days_until_resolution),
-            "n_outcomes": ev.n_outcomes,
-            "outcome_questions": [o.question for o in ev.outcomes],
-            "outcome_tokens_yes": [o.yes_token for o in ev.outcomes],
-        })
-    (lab.output_dir / "markets.json").write_text(json.dumps(info, indent=2))
-
-
-async def run_simulation(lab: Lab) -> None:
-    lab.log(f"=== HFT Sim v2 ===")
-    lab.log(f"Duração: {lab.duration_sec/3600:.1f}h")
-    lab.log(f"Mercados alvo: {lab.n_markets}")
-    lab.log(f"Output: {lab.output_dir}")
-    lab.log(f"Checkpoint interval: {CHECKPOINT_INTERVAL_SEC/60:.0f}min")
-    lab.log(f"Re-discovery: {REDISCOVERY_INTERVAL_SEC/60:.0f}min")
-    lab.log(f"Status.json: {STATUS_INTERVAL_SEC}s")
-
-    # 1. Descoberta
-    lab.log("Buscando events da Gamma...")
-    try:
-        all_events = await fetch_all_events()
-    except Exception as exc:
-        lab.log(f"FALHA na busca Gamma: {type(exc).__name__}: {exc}", level="ERROR")
-        return
-    lab.log(f"  {len(all_events)} events totais")
-
-    eligible = [ev for ev in all_events if event_passes_filters(ev)]
-    lab.log(f"  {len(eligible)} passaram filtros")
-
-    if len(eligible) < 10:
-        lab.log(
-            f"ERRO: muito poucos eligíveis ({len(eligible)}). "
-            "Relaxa filtros em CONFIG e tenta de novo.",
-            level="ERROR",
-        )
-        return
-
-    selected = select_diverse_markets(eligible, lab.n_markets)
-    lab.log(f"  {len(selected)} selecionados")
-
-    # 2. Construir estado
-    _build_events_from_selected(lab, selected)
-    _save_markets_info(lab)
-
-    if not lab.events:
-        lab.log("ERRO: nenhum event válido após build", level="ERROR")
-        return
-
-    by_vol = Counter(e.volume_bucket for e in lab.events)
-    by_cat = Counter(e.category for e in lab.events)
-    lab.log(f"  Por volume: {dict(by_vol)}")
-    lab.log(f"  Por categoria (top 5): {dict(by_cat.most_common(5))}")
+        lab.events.append(es)
 
     all_tokens = list(lab.token_to_outcome.keys())
     chunks = [
         all_tokens[i:i + MAX_TOKENS_PER_CONN]
         for i in range(0, len(all_tokens), MAX_TOKENS_PER_CONN)
     ]
-    lab.log(
-        f"{len(lab.events)} events, {len(all_tokens)} tokens, "
-        f"{len(chunks)} conexões WS"
-    )
+    lab.log(f"Total: {len(lab.events)} events, {len(all_tokens)} tokens, {len(chunks)} conexoes WS")
 
-    # 3. Schedule tasks
     lab.start_time = time.time()
     deadline = lab.start_time + lab.duration_sec
 
+    # Registrar handlers de sinal apos criacao do loop (para call_soon_threadsafe)
+    loop = asyncio.get_running_loop()
+    shutdown = lab.ensure_shutdown_event()
+
+    def _set_shutdown() -> None:
+        lab.log("Shutdown signal recebido, finalizando graceful...", level="WARN")
+        shutdown.set()
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, _set_shutdown)
+        loop.add_signal_handler(signal.SIGTERM, _set_shutdown)
+    except (NotImplementedError, RuntimeError):
+        # Fallback para Windows / contextos sem add_signal_handler
+        pass
+
     readers = [
-        asyncio.create_task(reader_task(lab, chunk, i, deadline), name=f"reader_{i}")
+        asyncio.create_task(reader_task(lab, chunk, i, deadline))
         for i, chunk in enumerate(chunks)
     ]
-    snap_t = asyncio.create_task(snapshot_task(lab, deadline), name="snapshot")
-    det_t = asyncio.create_task(detector_task(lab, deadline), name="detector")
-    persist_t = asyncio.create_task(persist_task(lab, deadline), name="persist")
-    status_t = asyncio.create_task(status_task(lab, deadline), name="status")
-    redisc_t = asyncio.create_task(rediscovery_task(lab, deadline), name="rediscovery")
-
-    all_tasks = readers + [snap_t, det_t, persist_t, status_t, redisc_t]
+    snap_t = asyncio.create_task(snapshot_task(lab, deadline))
+    det_t = asyncio.create_task(detector_task(lab, deadline))
+    persist_t = asyncio.create_task(persist_task(lab, deadline))
+    status_t = asyncio.create_task(status_task(lab, deadline))
+    rediscover_t = asyncio.create_task(rediscovery_task(lab, deadline))
+    all_tasks = readers + [snap_t, det_t, persist_t, status_t, rediscover_t]
 
     try:
         await asyncio.gather(*all_tasks, return_exceptions=True)
     except asyncio.CancelledError:
-        lab.log("Cancelamento recebido")
+        lab.log("Shutdown via CancelledError", level="WARN")
     finally:
-        # Final flush
-        persist_incremental(lab, force_tag="final")
-        # Status final
-        try:
-            final_status = compute_status(lab)
-            (lab.output_dir / "status.json").write_text(json.dumps(final_status, indent=2))
-        except Exception:
-            pass
-        lab.log(f"=== Sim finalizada ===")
-        lab.log(f"  Detecções totais: {len(lab.detections)}")
-        lab.log(f"  Detecções viáveis: "
-                f"{sum(1 for d in lab.detections if d.is_economically_viable)}")
-        lab.log(f"  Oportunidades abertas: {lab._next_opportunity_id}")
-        lab.log(f"  Oportunidades fechadas: {len(lab.detection_closes)}")
-        lab.log(f"  Medições decay: {len(lab.decay_measurements)}")
-        lab.log(f"  Checkpoints: {lab.persist_batch_counter}")
-        lab.log(f"  WS events: {sum(s['events'] for s in lab.conn_stats.values())}")
-        lab.log(f"  Reconnects: {sum(s['reconnects'] for s in lab.conn_stats.values())}")
-        lab.log(f"  Top rejeições de snapshot: "
-                f"{dict(lab.rejection_counts.most_common(10))}")
+        lab.log("Finalizando: persist final...")
+        persist_incremental(lab, tag="final")
+        lab.log(f"Total detecoes: {len(lab.detections)}")
+        lab.log(f"Total decay measurements: {len(lab.decays)}")
+        lab.log(f"Total WS events: {sum(s['events'] for s in lab.conn_stats.values())}")
+        lab.log(f"Total reconnects: {sum(s['reconnects'] for s in lab.conn_stats.values())}")
         lab.log(f"Output em: {lab.output_dir}")
-
-
-def _install_signal_handlers(lab: Lab, loop: asyncio.AbstractEventLoop) -> None:
-    def _handler(sig: int) -> None:
-        lab.log(f"Recebido sinal {sig}, shutdown graceful...", level="WARN")
-        lab.shutdown_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _handler, int(sig))
-        except NotImplementedError:
-            # Windows — fallback
-            signal.signal(sig, lambda s, f: lab.shutdown_event.set())
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="HFT Simulation Lab v2")
-    parser.add_argument("--hours", type=float, default=DEFAULT_DURATION_HOURS,
-                        help=f"Duração em horas (default: {DEFAULT_DURATION_HOURS})")
-    parser.add_argument("--markets", type=int, default=DEFAULT_N_MARKETS,
-                        help=f"Mercados alvo (default: {DEFAULT_N_MARKETS})")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Diretório de saída (default: ./output/run_TIMESTAMP)")
+    parser.add_argument(
+        "--hours", type=float, default=DEFAULT_DURATION_HOURS,
+        help=f"Duracao em horas (default: {DEFAULT_DURATION_HOURS})",
+    )
+    parser.add_argument(
+        "--markets", type=int, default=DEFAULT_N_MARKETS,
+        help=f"Numero de mercados (default: {DEFAULT_N_MARKETS})",
+    )
+    parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
-    if not HAS_PANDAS:
-        print("ABORTANDO: pandas/pyarrow obrigatórios em production mode.",
-              file=sys.stderr)
-        return 2
-
-    duration_sec = int(args.hours * 3600)
+    duration_sec = args.hours * 3600
     if args.output:
         output_dir = Path(args.output)
     else:
-        run_name = datetime.now(timezone.utc).strftime("run_%Y-%m-%d_%Hh%Mm")
+        run_name = datetime.now(timezone.utc).strftime("run_%Y-%m-%d_%Hh%M")
         output_dir = Path("./output") / run_name
 
     lab = Lab(
@@ -1790,18 +1391,17 @@ def main() -> int:
     )
 
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        _install_signal_handlers(lab, loop)
-        loop.run_until_complete(run_simulation(lab))
+        asyncio.run(run_simulation(lab))
     except KeyboardInterrupt:
-        lab.log("Interrompido pelo usuário", level="WARN")
+        lab.log("Interrompido (KeyboardInterrupt)")
+    except Exception as exc:
+        lab.log(
+            f"FATAL: {type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+            level="ERROR",
+        )
+        return 1
     finally:
         lab.close()
-        try:
-            loop.close()
-        except Exception:
-            pass
     return 0
 
 
